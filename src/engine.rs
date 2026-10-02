@@ -15,7 +15,7 @@ use solana_signer::Signer;
 use solana_transaction::Transaction;
 use zeroize::Zeroizing;
 
-use crate::audit::{Audit, Entry};
+use crate::audit::{Audit, Entry, KeyLock};
 use crate::checks::{self, Policy, Refusal, refuse as refusal};
 use crate::config::{Approval, Config, KeyConfig};
 use crate::keystore::KeyStore;
@@ -113,6 +113,8 @@ pub enum Mode {
 }
 
 const MINUTE: u64 = 60;
+/// Audit command of the entry written before a transaction is sent.
+const SIGN_INTENT: &str = "sign-intent";
 const DAY: u64 = 86_400;
 const POLL: Duration = Duration::from_secs(1);
 const MAX_RPC_FAILURES: u32 = 60;
@@ -148,6 +150,13 @@ pub fn execute(
         None => cfg.key_for_pubkey(&payload.fee_payer)?,
     };
     let signing = matches!(mode, Mode::Sign { .. });
+    // Held until this function returns, after the final audit entry: no other sign with this key,
+    // in this process or another, can pass the limit check in between.
+    let _lock = if signing {
+        Some(KeyLock::acquire(&cfg.state_dir, &key.name)?)
+    } else {
+        None
+    };
     let (report, sent) = if allowed.is_some_and(|keys| !keys.contains(&key.name)) {
         let r = refusal(
             "authorized",
@@ -320,6 +329,24 @@ fn pipeline(
         (tx, last_valid)
     };
     report.checks.push("approval");
+    // Durable before anything is sent: if this process dies mid-confirmation, the intent (with
+    // its simulated spend as a reservation) is what the limits and the operator see.
+    Audit::new(&cfg.state_dir).append(Entry {
+        ts: now(),
+        key: key.name.clone(),
+        command: SIGN_INTENT.to_owned(),
+        payload_hash: payload.hash.clone(),
+        programs: program_ids(payload),
+        summary: payload.summary.clone(),
+        intent: match mode {
+            Mode::Sign { intent } => intent.clone(),
+            Mode::Check => None,
+        },
+        outcome: "pending".to_owned(),
+        signature: tx.signatures.first().map(ToString::to_string),
+        balance_change: report.balance_change,
+        ..Entry::default()
+    })?;
     let explorer = cfg.cluster.explorer_tx;
     send_and_confirm(
         &rpc,
@@ -555,13 +582,25 @@ fn confirm(report: &Report, key: &KeyConfig) -> Result<bool> {
     Ok(answer.trim() == "yes")
 }
 
+/// Rate and daily-spend limits from the audit log.
+///
+/// Every attempt counts toward the rate: final `sign` entries, plus intents that never got one
+/// (the process died mid-sign). Spend counts what each sent transaction cost when that is known
+/// (confirmed or failed, with metadata). When it is not known (the outcome is unknown, the
+/// metadata never arrived, or the process died), the intent's simulated spend is charged as a
+/// reservation, and with no simulation figure the whole daily cap is: an unresolved transaction
+/// may have landed, so it is never free.
 fn limits(entries: &[Entry], key: &KeyConfig, now: u64) -> Result<(), Refusal> {
-    let mine = || {
-        entries
-            .iter()
-            .filter(|e| e.key == key.name && e.command == "sign")
+    let mine: Vec<&Entry> = entries.iter().filter(|e| e.key == key.name).collect();
+    let finals = || mine.iter().filter(|e| e.command == "sign");
+    let resolved = |sig: &str| finals().any(|e| e.signature.as_deref() == Some(sig));
+    let orphan_intents = || {
+        mine.iter().filter(|e| {
+            e.command == SIGN_INTENT && e.signature.as_deref().is_none_or(|s| !resolved(s))
+        })
     };
-    let recent = mine()
+    let recent = finals()
+        .chain(orphan_intents())
         .filter(|e| e.ts >= now.saturating_sub(MINUTE))
         .count();
     if recent >= usize::try_from(key.rate_limit_per_minute).unwrap_or(usize::MAX) {
@@ -570,21 +609,44 @@ fn limits(entries: &[Entry], key: &KeyConfig, now: u64) -> Result<(), Refusal> {
             format!("rate limit: {recent} signs in the last minute"),
         ));
     }
-    let spent = mine()
-        .filter(|e| e.ts >= now.saturating_sub(DAY))
-        .filter_map(|e| e.balance_change)
-        .filter(|d| *d < 0)
-        .fold(0_u64, |acc, d| acc.saturating_add(d.unsigned_abs()));
-    if spent >= key.daily_lamport_cap {
+    let cap = key.daily_lamport_cap;
+    let reservation = |sig: Option<&str>| -> u64 {
+        let intent = mine
+            .iter()
+            .find(|e| e.command == SIGN_INTENT && sig.is_some() && e.signature.as_deref() == sig);
+        match intent.map(|e| e.balance_change) {
+            Some(Some(d)) => spend(d),
+            _ => cap,
+        }
+    };
+    let day = |e: &&&Entry| e.ts >= now.saturating_sub(DAY);
+    let mut spent: u64 = 0;
+    for e in finals().filter(day) {
+        let cost = match e.outcome.as_str() {
+            "confirmed" | "failed" => e
+                .balance_change
+                .map_or_else(|| reservation(e.signature.as_deref()), spend),
+            "unknown" => reservation(e.signature.as_deref()),
+            // Proven not landed, or never sent.
+            _ => 0,
+        };
+        spent = spent.saturating_add(cost);
+    }
+    for e in orphan_intents().filter(day) {
+        spent = spent.saturating_add(e.balance_change.map_or(cap, spend));
+    }
+    if spent >= cap {
         return Err(refusal(
             "limits",
-            format!(
-                "daily cap: {spent} of {} lamports spent in 24 h",
-                key.daily_lamport_cap
-            ),
+            format!("daily cap: {spent} of {cap} lamports spent or reserved in 24 h"),
         ));
     }
     Ok(())
+}
+
+/// Lamports spent by a balance change (gains spend nothing).
+const fn spend(delta: i64) -> u64 {
+    if delta < 0 { delta.unsigned_abs() } else { 0 }
 }
 
 fn read_payload(arg: &str) -> Result<Zeroizing<String>> {
@@ -665,9 +727,116 @@ mod tests {
             ts,
             key: "k".into(),
             command: "sign".into(),
+            outcome: "confirmed".into(),
             balance_change: Some(change),
             ..Entry::default()
         }
+    }
+
+    fn intent(ts: u64, sig: &str, reserved: Option<i64>) -> Entry {
+        Entry {
+            ts,
+            key: "k".into(),
+            command: SIGN_INTENT.into(),
+            outcome: "pending".into(),
+            signature: Some(sig.into()),
+            balance_change: reserved,
+            ..Entry::default()
+        }
+    }
+
+    fn sign_final(ts: u64, sig: &str, outcome: &str, change: Option<i64>) -> Entry {
+        Entry {
+            ts,
+            key: "k".into(),
+            command: "sign".into(),
+            outcome: outcome.into(),
+            signature: Some(sig.into()),
+            balance_change: change,
+            ..Entry::default()
+        }
+    }
+
+    fn roomy() -> KeyConfig {
+        KeyConfig {
+            rate_limit_per_minute: 100,
+            ..key()
+        }
+    }
+
+    // Pinchy's review, P1: a spend whose outcome is not known still reserves its simulated cost.
+    #[test]
+    fn unresolved_spends_are_charged_their_reservation() {
+        let k = roomy(); // daily cap 1_000
+        // Unknown outcome: the intent's simulated -600 is charged; with another -500 that is over.
+        let unknown = [
+            intent(10, "a", Some(-600)),
+            sign_final(11, "a", "unknown", None),
+            entry(12, -500),
+        ];
+        assert!(limits(&unknown, &k, 100).is_err());
+        // Confirmed without metadata: same.
+        let no_meta = [
+            intent(10, "a", Some(-600)),
+            sign_final(11, "a", "confirmed", None),
+            entry(12, -500),
+        ];
+        assert!(limits(&no_meta, &k, 100).is_err());
+        // The process died after sending: the orphan intent is charged.
+        let orphan = [intent(10, "a", Some(-600)), entry(12, -500)];
+        assert!(limits(&orphan, &k, 100).is_err());
+        // No simulated figure to reserve: the whole cap is charged.
+        let blind = [intent(10, "a", None)];
+        assert!(limits(&blind, &k, 100).is_err());
+        // Proven not landed: nothing is charged.
+        let expired = [
+            intent(10, "a", Some(-600)),
+            sign_final(11, "a", "expired", None),
+            entry(12, -500),
+        ];
+        assert!(limits(&expired, &k, 100).is_ok());
+        // Known cost replaces the reservation.
+        let known = [
+            intent(10, "a", Some(-600)),
+            sign_final(11, "a", "confirmed", Some(-5)),
+            entry(12, -500),
+        ];
+        assert!(limits(&known, &k, 100).is_ok());
+    }
+
+    #[test]
+    fn an_orphan_intent_counts_toward_the_rate() {
+        let k = key(); // 2 per minute
+        assert!(limits(&[intent(100, "a", Some(-1))], &k, 120).is_ok());
+        assert!(
+            limits(&[intent(100, "a", Some(-1)), entry(110, -1)], &k, 120).is_err(),
+            "an attempt whose final entry never arrived is still an attempt"
+        );
+    }
+
+    // Pinchy's review, P1: concurrent signs with one key must not all pass the limit check.
+    #[test]
+    fn the_key_lock_serializes_signs_across_threads() {
+        use std::sync::mpsc;
+        let dir = std::env::temp_dir().join(format!("sa-forge-signer-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let held = KeyLock::acquire(&dir, "k").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let dir2 = dir.clone();
+        let waiter = std::thread::spawn(move || {
+            let _second = KeyLock::acquire(&dir2, "k").unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "a second sign must wait while the first holds the key"
+        );
+        // A different key is not blocked.
+        assert!(KeyLock::acquire(&dir, "other").is_ok());
+        drop(held);
+        assert!(rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        waiter.join().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
