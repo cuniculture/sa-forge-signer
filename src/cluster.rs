@@ -10,6 +10,9 @@ pub struct Cluster {
 }
 
 pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
+pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+pub const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+pub const ASSOCIATED_TOKEN_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 
 pub const ZINK_TESTNET: Cluster = Cluster {
     name: "zink-testnet",
@@ -30,11 +33,9 @@ pub const ZINK_TESTNET: Cluster = Cluster {
             "compute-budget",
             "ComputeBudget111111111111111111111111111111",
         ),
-        ("spl-token", "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
-        (
-            "associated-token",
-            "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
-        ),
+        // SPL Token is deliberately absent, and refused at the top level by `checks::tokens` even
+        // if a key lists it in `extra_programs`: no forge-mcp build calls it directly.
+        ("associated-token", ASSOCIATED_TOKEN_PROGRAM),
         ("system", SYSTEM_PROGRAM),
     ],
 };

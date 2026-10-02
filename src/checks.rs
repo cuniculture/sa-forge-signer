@@ -7,7 +7,7 @@ use solana_address::Address;
 use solana_message::Message;
 use solana_message::compiled_instruction::CompiledInstruction;
 
-use crate::cluster::SYSTEM_PROGRAM;
+use crate::cluster::{ASSOCIATED_TOKEN_PROGRAM, SYSTEM_PROGRAM, TOKEN_2022_PROGRAM, TOKEN_PROGRAM};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Refusal {
@@ -32,20 +32,25 @@ pub struct Policy<'a> {
     pub partial_signers: &'a [Address],
 }
 
-// Public System Program instruction indices.
-const SYS_CREATE_ACCOUNT: u32 = 0;
-const SYS_ASSIGN: u32 = 1;
+// Public System Program instruction index. Only Transfer is allowed at the top level: forge-mcp
+// builds no top-level System instruction (new accounts are created inside the game programs), and
+// every account-creating form (CreateAccount, CreateAccountWithSeed, Assign, Allocate) can fund or
+// take over an account whose keypair the requester holds, moving lamports outside the signer.
 const SYS_TRANSFER: u32 = 2;
-const SYS_CREATE_ACCOUNT_WITH_SEED: u32 = 3;
-const SYS_ALLOCATE: u32 = 8;
+
+// Associated Token Account program instructions that only create an account (rent from the fee
+// payer, owned by the token program). RecoverNested (2) moves tokens and is refused.
+const ATA_CREATE: u8 = 0;
+const ATA_CREATE_IDEMPOTENT: u8 = 1;
 
 /// Runs every check that needs only the message; returns the names of the checks passed.
 pub fn structural(message: &Message, policy: &Policy<'_>) -> Result<Vec<&'static str>, Refusal> {
     fee_payer(message, policy)?;
     programs(message, policy)?;
+    tokens(message)?;
     system(message, policy)?;
     signers(message, policy)?;
-    Ok(vec!["fee_payer", "programs", "system", "signers"])
+    Ok(vec!["fee_payer", "programs", "tokens", "system", "signers"])
 }
 
 fn fee_payer(message: &Message, policy: &Policy<'_>) -> Result<(), Refusal> {
@@ -73,6 +78,43 @@ fn programs(message: &Message, policy: &Policy<'_>) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// Token programs are never called at the top level, whatever the key's `extra_programs` say: their
+/// transfers, approvals and authority changes move assets with no destination rule here, and the
+/// daily cap counts lamports only. Token movement in play happens inside SAGE, which checks its own
+/// accounts. The ATA program may only create accounts.
+fn tokens(message: &Message) -> Result<(), Refusal> {
+    let parse = |s: &str| Address::from_str(s).map_err(|e| refuse("tokens", e.to_string()));
+    let token = parse(TOKEN_PROGRAM)?;
+    let token_2022 = parse(TOKEN_2022_PROGRAM)?;
+    let ata = parse(ASSOCIATED_TOKEN_PROGRAM)?;
+    for (i, ix) in message.instructions.iter().enumerate() {
+        let Some(program) = program_of(message, ix) else {
+            continue;
+        };
+        if program == &token || program == &token_2022 {
+            return Err(refuse(
+                "tokens",
+                format!(
+                    "instruction {i} calls token program {program} directly, which is not allowed"
+                ),
+            ));
+        }
+        if program == &ata {
+            // An empty data field is the legacy Create.
+            let tag = ix.data.first().copied().unwrap_or(ATA_CREATE);
+            if ix.data.len() > 1 || !matches!(tag, ATA_CREATE | ATA_CREATE_IDEMPOTENT) {
+                return Err(refuse(
+                    "tokens",
+                    format!(
+                        "instruction {i} is associated-token instruction {tag}; only create is allowed"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn system(message: &Message, policy: &Policy<'_>) -> Result<(), Refusal> {
     let system = Address::from_str(SYSTEM_PROGRAM).map_err(|e| refuse("system", e.to_string()))?;
     for (i, ix) in message.instructions.iter().enumerate() {
@@ -86,22 +128,7 @@ fn system(message: &Message, policy: &Policy<'_>) -> Result<(), Refusal> {
             .map(u32::from_le_bytes)
             .ok_or_else(|| refuse("system", format!("instruction {i} is too short")))?;
         let account = |n: usize| account_of(message, ix, n);
-        let new_account = |n: usize, what: &str| match account(n) {
-            Some(a) if policy.partial_signers.contains(a) => Ok(()),
-            Some(a) => Err(refuse(
-                "system",
-                format!("instruction {i} {what} {a}, which is not a new account from this payload"),
-            )),
-            None => Err(refuse(
-                "system",
-                format!("instruction {i} is missing an account"),
-            )),
-        };
         match tag {
-            SYS_CREATE_ACCOUNT => new_account(1, "creates")?,
-            SYS_ASSIGN => new_account(0, "assigns")?,
-            SYS_ALLOCATE => new_account(0, "allocates")?,
-            SYS_CREATE_ACCOUNT_WITH_SEED => {}
             SYS_TRANSFER => match account(1) {
                 Some(to) if policy.transfer_to.contains(to) => {}
                 Some(to) => {
@@ -261,22 +288,111 @@ mod tests {
         assert!(run(&[ix], &addr(1), &[], &[addr(3)]).is_ok());
     }
 
+    // Pinchy's review, P0: a requester-held new keypair must not be fundable or assignable at the top
+    // level, by any account-creating System instruction, partial signer or not.
     #[test]
-    fn create_account_needs_a_partial_signer() {
-        let ix = system_ix(
-            SYS_CREATE_ACCOUNT,
+    fn refuses_every_account_creating_system_instruction() {
+        const CREATE_ACCOUNT: u32 = 0;
+        const ASSIGN: u32 = 1;
+        const CREATE_WITH_SEED: u32 = 3;
+        const ALLOCATE: u32 = 8;
+        let payer_and_new = || {
             vec![
                 AccountMeta::new(addr(1), true),
                 AccountMeta::new(addr(4), true),
+            ]
+        };
+        for (tag, accounts) in [
+            (CREATE_ACCOUNT, payer_and_new()),
+            (CREATE_WITH_SEED, payer_and_new()),
+            (ASSIGN, vec![AccountMeta::new(addr(4), true)]),
+            (ALLOCATE, vec![AccountMeta::new(addr(4), true)]),
+        ] {
+            let ix = system_ix(tag, accounts);
+            let refusal = run(&[ix], &addr(1), &[addr(4)], &[]).unwrap_err();
+            assert_eq!(
+                refusal.check, "system",
+                "System instruction {tag} must be refused"
+            );
+        }
+    }
+
+    fn token_ix(program: &str, data: Vec<u8>) -> Instruction {
+        Instruction {
+            program_id: Address::from_str(program).unwrap(),
+            accounts: vec![
+                AccountMeta::new(addr(1), true),
+                AccountMeta::new(addr(3), false),
             ],
+            data,
+        }
+    }
+
+    fn run_allowing(ixs: &[Instruction], extra: &[&str]) -> Result<Vec<&'static str>, Refusal> {
+        let message = Message::new(ixs, Some(&addr(1)));
+        let mut allowed = vec![Address::from_str(SYSTEM_PROGRAM).unwrap(), addr(9)];
+        allowed.extend(extra.iter().map(|p| Address::from_str(p).unwrap()));
+        structural(
+            &message,
+            &Policy {
+                signer: &addr(1),
+                allowed_programs: &allowed,
+                transfer_to: &[],
+                partial_signers: &[],
+            },
+        )
+    }
+
+    // Pinchy's review, P0: SPL movement had no destination rule. Token programs are refused at the top
+    // level even when a key's extra_programs lists them.
+    #[test]
+    fn refuses_direct_token_program_calls_even_when_listed() {
+        const TRANSFER: u8 = 3;
+        for program in [TOKEN_PROGRAM, TOKEN_2022_PROGRAM] {
+            let ix = token_ix(program, vec![TRANSFER, 1, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(
+                run_allowing(&[ix], &[program]).unwrap_err().check,
+                "tokens",
+                "{program} must be refused at the top level"
+            );
+        }
+    }
+
+    #[test]
+    fn associated_token_program_may_only_create() {
+        const RECOVER_NESTED: u8 = 2;
+        for data in [vec![], vec![ATA_CREATE], vec![ATA_CREATE_IDEMPOTENT]] {
+            let ix = token_ix(ASSOCIATED_TOKEN_PROGRAM, data.clone());
+            assert!(
+                run_allowing(&[ix], &[ASSOCIATED_TOKEN_PROGRAM]).is_ok(),
+                "ATA create {data:?} is allowed"
+            );
+        }
+        for data in [vec![RECOVER_NESTED], vec![ATA_CREATE_IDEMPOTENT, 0]] {
+            let ix = token_ix(ASSOCIATED_TOKEN_PROGRAM, data.clone());
+            assert_eq!(
+                run_allowing(&[ix], &[ASSOCIATED_TOKEN_PROGRAM])
+                    .unwrap_err()
+                    .check,
+                "tokens",
+                "ATA instruction {data:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn spl_token_is_not_in_the_default_program_list() {
+        assert!(
+            crate::cluster::ZINK_TESTNET
+                .programs
+                .iter()
+                .all(|(_, p)| *p != TOKEN_PROGRAM && *p != TOKEN_2022_PROGRAM)
         );
-        assert!(run(std::slice::from_ref(&ix), &addr(1), &[addr(4)], &[]).is_ok());
-        assert_eq!(run(&[ix], &addr(1), &[], &[]).unwrap_err().check, "system");
     }
 
     #[test]
     fn refuses_assigning_the_signing_key() {
-        let ix = system_ix(SYS_ASSIGN, vec![AccountMeta::new(addr(1), true)]);
+        let ix = system_ix(1, vec![AccountMeta::new(addr(1), true)]); // Assign
         assert_eq!(run(&[ix], &addr(1), &[], &[]).unwrap_err().check, "system");
     }
 
