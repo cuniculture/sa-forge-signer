@@ -1,0 +1,31 @@
+# sa-forge-signer config. Default location: ~/.config/sa-forge-signer/config.toml
+# Relative paths resolve against this file's directory.
+
+cluster = "zink-testnet"
+# rpc_url = "https://rpc1.z.ink"   # default for the cluster
+# key_dir = "keys"                 # 0700; one 0600 file per key
+# state_dir = "state"              # audit log
+
+# A SAGE-scoped session key (profile key index 1 or later). Signs without asking.
+[keys.alice-session]
+class = "session"
+pubkey = "REPLACE_WITH_PUBKEY_FROM_key_new"
+# profile = "PROFILE_ADDRESS"
+# rate_limit_per_minute = 30
+# daily_lamport_cap = 50000000     # 0.05 ZINK
+
+# Path A only: the profile authority and asset wallet held by the agent.
+# Defaults to approval = "confirm": each signature is approved on the terminal.
+# [keys.alice-wallet]
+# class = "wallet"
+# pubkey = "WALLET_PUBKEY"
+# transfer_to = ["PROFILE_ADDRESS", "SESSION_KEY_PUBKEY"]  # fund the vault and the session key
+
+# `sa-forge-signer serve`: HTTP at /v1/check and /v1/sign, MCP at /mcp.
+# [serve]
+# listen = "127.0.0.1:8790"
+# allowed_hosts = ["127.0.0.1", "localhost"]
+# [[serve.tokens]]                  # from `sa-forge-signer token new <name> --out <file>`
+# name = "agent"
+# sha256 = "HASH_PRINTED_BY_token_new"
+# keys = ["alice-session"]

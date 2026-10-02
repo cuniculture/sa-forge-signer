@@ -1,0 +1,35 @@
+# Local git review: squash the current branch into one staged diff vs a target branch, then approve.
+# Self-contained; import from a root justfile that defines a `check` recipe:
+#   import "scripts/git-review/justfile"
+
+# Open a review of the current branch against target (default main): run just check, back up, soft reset
+[group('git-review')]
+[positional-arguments]
+mr-open target="main":
+    @{{ source_directory() }}/start.sh "$1"
+
+# Show the staged review diff
+[group('git-review')]
+mr-diff:
+    git diff --cached
+
+# Show the staged review diff word by word (for prose)
+[group('git-review')]
+mr-diff-words:
+    git diff --cached --word-diff=color
+
+# Show the incremental commits behind the open review
+[group('git-review')]
+mr-log:
+    @{{ source_directory() }}/log.sh
+
+# Cancel a review: restore the incremental commits (review edits stay uncommitted)
+[group('git-review')]
+mr-abort:
+    @{{ source_directory() }}/abort.sh
+
+# Approve a review: commit the staged diff, fast-forward the target, delete branch and backup
+[group('git-review')]
+[positional-arguments]
+mr-approve msg:
+    @{{ source_directory() }}/approve.sh "$1"

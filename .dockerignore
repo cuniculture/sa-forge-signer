@@ -1,0 +1,8 @@
+# Never send keys, config, state or build output to the Docker build.
+target/
+keys/
+state/
+config.toml
+.git/
+.github/
+*.payload.json

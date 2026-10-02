@@ -1,0 +1,5 @@
+/target
+keys/
+state/
+config.toml
+*.payload.json
