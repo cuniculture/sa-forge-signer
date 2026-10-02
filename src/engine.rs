@@ -712,6 +712,7 @@ mod tests {
         KeyConfig {
             name: "k".into(),
             class: KeyClass::Session,
+            allow_unattended: false,
             pubkey: Address::new_from_array([1; 32]),
             profile: None,
             approval: Approval::Auto,

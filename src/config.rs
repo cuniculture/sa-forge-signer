@@ -76,6 +76,10 @@ struct RawKey {
     extra_programs: Vec<String>,
     rate_limit_per_minute: Option<u32>,
     daily_lamport_cap: Option<u64>,
+    /// Wallet keys only: permit `approval = "auto"` and serve tokens. Off by default; only for a
+    /// throwaway testnet key whose grants you do not mind an agent choosing.
+    #[serde(default)]
+    allow_unattended: bool,
 }
 
 fn default_cluster() -> String {
@@ -85,6 +89,7 @@ fn default_cluster() -> String {
 pub struct KeyConfig {
     pub name: String,
     pub class: KeyClass,
+    pub allow_unattended: bool,
     pub pubkey: Address,
     pub profile: Option<Address>,
     pub approval: Approval,
@@ -177,6 +182,14 @@ impl Config {
                 KeyClass::Session => Approval::Auto,
                 KeyClass::Wallet => Approval::Confirm,
             });
+            // A wallet key is the profile authority: the signer does not decode a Player Profile
+            // grant's recipient or permissions, so an automatically approved wallet key would sign
+            // whatever grant a requester built. It signs only with a person at the terminal.
+            if k.class == KeyClass::Wallet && approval == Approval::Auto && !k.allow_unattended {
+                bail!(
+                    "keys.{name}: a wallet key cannot use approval = \"auto\"; use \"confirm\" (a person approves each signature at the terminal) or \"deny\", or set allow_unattended = true for a throwaway testnet key"
+                );
+            }
             keys.push(KeyConfig {
                 pubkey: parse_address(&format!("keys.{name}.pubkey"), &k.pubkey)?,
                 profile: k
@@ -187,6 +200,7 @@ impl Config {
                 transfer_to: addrs("transfer_to", &k.transfer_to)?,
                 extra_programs: addrs("extra_programs", &k.extra_programs)?,
                 class: k.class,
+                allow_unattended: k.allow_unattended,
                 approval,
                 rate_limit_per_minute: k.rate_limit_per_minute.unwrap_or(DEFAULT_RATE_PER_MINUTE),
                 daily_lamport_cap: k.daily_lamport_cap.unwrap_or(DEFAULT_DAILY_LAMPORT_CAP),
@@ -253,6 +267,17 @@ fn serve_from_raw(raw: RawServe, keys: &[KeyConfig]) -> Result<ServeConfig> {
         if let Some(k) = t.keys.iter().find(|k| !keys.iter().any(|c| &c.name == *k)) {
             bail!("serve.tokens.{}: no key {k:?} in the config", t.name);
         }
+        // Serve has no terminal: a wallet key on a token could only ever be refused (confirm) or,
+        // worse, would put the profile authority behind an agent-reachable token. Use the CLI.
+        if let Some(k) = t.keys.iter().find(|k| {
+            keys.iter()
+                .any(|c| &c.name == *k && c.class == KeyClass::Wallet && !c.allow_unattended)
+        }) {
+            bail!(
+                "serve.tokens.{}: key {k:?} is a wallet key; wallet keys sign only through the CLI with a person at the terminal, unless the key sets allow_unattended = true (throwaway testnet keys only)",
+                t.name
+            );
+        }
         tokens.push(TokenConfig {
             name: t.name,
             sha256: t.sha256,
@@ -286,6 +311,39 @@ mod tests {
         assert_eq!(c.key("b").unwrap().approval, Approval::Confirm);
         assert_eq!(c.key_dir, PathBuf::from("/cfg/keys"));
         assert_eq!(c.rpc_url, "https://rpc1.z.ink");
+    }
+
+    // Pinchy's review, P1: the profile authority must never sign unattended or behind a token.
+    #[test]
+    fn a_wallet_key_cannot_be_auto_approved() {
+        let auto =
+            format!("[keys.p]\nclass = \"wallet\"\npubkey = \"{KEY}\"\napproval = \"auto\"\n");
+        assert!(parse(&auto).is_err());
+        let confirm =
+            format!("[keys.p]\nclass = \"wallet\"\npubkey = \"{KEY}\"\napproval = \"confirm\"\n");
+        assert!(parse(&confirm).is_ok());
+        let opted_in = format!(
+            "[keys.p]\nclass = \"wallet\"\npubkey = \"{KEY}\"\napproval = \"auto\"\nallow_unattended = true\n"
+        );
+        assert!(parse(&opted_in).is_ok(), "an explicit opt-in is honoured");
+        let session_auto =
+            format!("[keys.s]\nclass = \"session\"\npubkey = \"{KEY}\"\napproval = \"auto\"\n");
+        assert!(parse(&session_auto).is_ok());
+    }
+
+    #[test]
+    fn a_serve_token_cannot_reach_a_wallet_key() {
+        let hash = "0".repeat(64);
+        let with = |key: &str| {
+            format!(
+                "[keys.p]\nclass = \"wallet\"\npubkey = \"{KEY}\"\n[keys.s]\nclass = \"session\"\npubkey = \"{KEY}\"\n[serve]\n[[serve.tokens]]\nname = \"agent\"\nsha256 = \"{hash}\"\nkeys = [\"{key}\"]\n"
+            )
+        };
+        assert!(
+            parse(&with("p")).is_err(),
+            "a token must not grant the wallet key"
+        );
+        assert!(parse(&with("s")).is_ok());
     }
 
     #[test]

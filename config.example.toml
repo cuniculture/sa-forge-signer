@@ -16,6 +16,9 @@ pubkey = "REPLACE_WITH_PUBKEY_FROM_key_new"
 
 # Path A only: the profile authority and asset wallet held by the agent.
 # Defaults to approval = "confirm": each signature is approved on the terminal.
+# A wallet key cannot be "auto" or listed on a serve token: it signs only through the CLI
+# with a person at the terminal. allow_unattended = true lifts both rules; use it only for a
+# throwaway testnet key, since the signer does not decode what a profile grant gives away.
 # [keys.alice-wallet]
 # class = "wallet"
 # pubkey = "WALLET_PUBKEY"
