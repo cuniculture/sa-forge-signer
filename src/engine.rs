@@ -20,7 +20,7 @@ use crate::checks::{self, Policy, Refusal, refuse as refusal};
 use crate::config::{Approval, Config, KeyConfig};
 use crate::keystore::KeyStore;
 use crate::payload::Payload;
-use crate::rpc::{Chain, Rpc, RpcError, delta};
+use crate::rpc::{Chain, Rpc, RpcError, Status, delta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,7 +32,8 @@ pub enum Outcome {
     Confirmed,
     /// Landed with a program error.
     Failed,
-    /// Blockhash expired without landing; safe to rebuild.
+    /// Proven not landed: the finalized block height passed the blockhash's last valid height and
+    /// a full-history lookup from a node at least that current found no trace. Safe to rebuild.
     Expired,
     /// Sent but not resolved; check the signature before retrying.
     Unknown,
@@ -115,6 +116,10 @@ const MINUTE: u64 = 60;
 const DAY: u64 = 86_400;
 const POLL: Duration = Duration::from_secs(1);
 const MAX_RPC_FAILURES: u32 = 60;
+/// Longest a sign waits to prove an outcome. Expiry is proven against the finalized tip, which
+/// trails the confirmed one, so this covers a blockhash's ~150-block life plus finalization; a
+/// stalled or lagging RPC that never lets either proof complete ends here as `unknown`.
+pub const CONFIRM_DEADLINE: Duration = Duration::from_secs(150);
 const META_ATTEMPTS: u32 = 10;
 
 pub fn run(cfg: &Config, key_name: Option<&str>, payload_arg: &str, mode: &Mode) -> Result<Report> {
@@ -319,7 +324,16 @@ fn pipeline(
     };
     report.checks.push("approval");
     let explorer = cfg.cluster.explorer_tx;
-    send_and_confirm(&rpc, &tx, last_valid, report, explorer, POLL).map(|r| (r, true))
+    send_and_confirm(
+        &rpc,
+        &tx,
+        last_valid,
+        report,
+        explorer,
+        POLL,
+        CONFIRM_DEADLINE,
+    )
+    .map(|r| (r, true))
 }
 
 fn send_and_confirm(
@@ -329,7 +343,9 @@ fn send_and_confirm(
     mut report: Report,
     explorer: &str,
     poll: Duration,
+    deadline: Duration,
 ) -> Result<Report> {
+    let started = std::time::Instant::now();
     let wire = encode(tx)?;
     let signature = tx
         .signatures
@@ -343,44 +359,42 @@ fn send_and_confirm(
     }
     let mut failures: u32 = 0;
     let mut polls: u32 = 0;
+    // A landed status (confirmed or finalized) ends the wait from either lookup. `Expired` needs
+    // proof, never mere silence: the finalized height must be past last_valid (no fork can still
+    // include the transaction), and a full-history lookup from a node at least as far as that
+    // finalized slot must find nothing. An error, a lagging node, or a merely processed status is
+    // not proof; the loop keeps waiting and, at the deadline, reports `unknown`.
     report.outcome = loop {
         std::thread::sleep(poll);
         polls = polls.saturating_add(1);
         match chain.signature_status(&signature) {
-            Ok(Some(st))
-                if matches!(st.confirmation.as_deref(), Some("confirmed" | "finalized")) =>
-            {
-                report.slot = Some(st.slot);
-                break match st.err {
-                    Some(err) => {
-                        report.error = Some(err);
-                        Outcome::Failed
-                    }
-                    None => Outcome::Confirmed,
-                };
-            }
+            Ok(Some(st)) if st.landed() => break landed_outcome(&mut report, st),
             Ok(_) => {}
             Err(e) => failures = note_failure(failures, &mut report, &e),
         }
-        match chain.block_height() {
-            Ok(h) if h > last_valid => {
-                // One last look: it may have landed in the final valid block.
-                if let Ok(Some(st)) = chain.signature_status(&signature) {
-                    report.slot = Some(st.slot);
-                    break match st.err {
-                        Some(err) => {
-                            report.error = Some(err);
-                            Outcome::Failed
-                        }
-                        None => Outcome::Confirmed,
-                    };
+        match chain.finalized() {
+            Ok(tip) if tip.block_height > last_valid => {
+                match chain.signature_status_history(&signature) {
+                    Ok(h) => match h.status {
+                        Some(st) if st.landed() => break landed_outcome(&mut report, st),
+                        None if h.context_slot >= tip.slot => break Outcome::Expired,
+                        // Processed but unconfirmed, or a node behind the finalized tip.
+                        _ => {}
+                    },
+                    Err(e) => failures = note_failure(failures, &mut report, &e),
                 }
-                break Outcome::Expired;
             }
             Ok(_) => {}
             Err(e) => failures = note_failure(failures, &mut report, &e),
         }
         if failures >= MAX_RPC_FAILURES {
+            break Outcome::Unknown;
+        }
+        if started.elapsed() >= deadline {
+            report.detail = Some(format!(
+                "no proven outcome within {}s; look up the signature before retrying",
+                deadline.as_secs()
+            ));
             break Outcome::Unknown;
         }
         if polls.is_multiple_of(3) {
@@ -404,6 +418,17 @@ fn send_and_confirm(
         }
     }
     Ok(report)
+}
+
+fn landed_outcome(report: &mut Report, st: Status) -> Outcome {
+    report.slot = Some(st.slot);
+    match st.err {
+        Some(err) => {
+            report.error = Some(err);
+            Outcome::Failed
+        }
+        None => Outcome::Confirmed,
+    }
 }
 
 fn note_failure(failures: u32, report: &mut Report, e: &RpcError) -> u32 {
@@ -639,39 +664,72 @@ mod tests {
         assert_eq!(program_error(&logs(&["Program X success"])), None);
     }
 
-    use crate::rpc::{Status, TxMeta};
+    use crate::rpc::{Finalized, HistoryStatus, Status, TxMeta};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
+    type R<T> = std::result::Result<T, RpcError>;
+
+    /// A scripted chain: each queue is consumed in order, then the default repeats.
     #[derive(Default)]
     struct Fake {
-        statuses: RefCell<VecDeque<std::result::Result<Option<Status>, RpcError>>>,
-        heights: RefCell<VecDeque<std::result::Result<u64, RpcError>>>,
+        statuses: RefCell<VecDeque<R<Option<Status>>>>,
+        history: RefCell<VecDeque<R<HistoryStatus>>>,
+        tips: RefCell<VecDeque<R<Finalized>>>,
+        /// Repeated once `tips` is empty (default: height 0, never past `last_valid`).
+        steady_tip: Cell<Option<(u64, u64)>>,
         meta: RefCell<Option<TxMeta>>,
         sends: Cell<u32>,
     }
 
     impl Chain for Fake {
-        fn send(&self, _: &str) -> std::result::Result<String, RpcError> {
+        fn send(&self, _: &str) -> R<String> {
             self.sends.set(self.sends.get().saturating_add(1));
             Ok("sig".into())
         }
-        fn signature_status(&self, _: &str) -> std::result::Result<Option<Status>, RpcError> {
+        fn signature_status(&self, _: &str) -> R<Option<Status>> {
             self.statuses.borrow_mut().pop_front().unwrap_or(Ok(None))
         }
-        fn block_height(&self) -> std::result::Result<u64, RpcError> {
-            self.heights.borrow_mut().pop_front().unwrap_or(Ok(0))
+        fn signature_status_history(&self, _: &str) -> R<HistoryStatus> {
+            self.history
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(Ok(HistoryStatus {
+                    context_slot: 0,
+                    status: None,
+                }))
         }
-        fn transaction_meta(&self, _: &str) -> std::result::Result<Option<TxMeta>, RpcError> {
+        fn finalized(&self) -> R<Finalized> {
+            self.tips.borrow_mut().pop_front().unwrap_or_else(|| {
+                let (slot, block_height) = self.steady_tip.get().unwrap_or((0, 0));
+                Ok(Finalized { slot, block_height })
+            })
+        }
+        fn transaction_meta(&self, _: &str) -> R<Option<TxMeta>> {
             Ok(self.meta.borrow_mut().take())
         }
     }
 
-    fn landed(err: Option<Value>) -> Status {
+    fn status(confirmation: &str, err: Option<Value>) -> Status {
         Status {
             slot: 42,
             err,
-            confirmation: Some("confirmed".into()),
+            confirmation: Some(confirmation.into()),
+        }
+    }
+
+    fn landed(err: Option<Value>) -> Status {
+        status("confirmed", err)
+    }
+
+    const fn tip(slot: u64, block_height: u64) -> Finalized {
+        Finalized { slot, block_height }
+    }
+
+    const fn seen(context_slot: u64, status: Option<Status>) -> HistoryStatus {
+        HistoryStatus {
+            context_slot,
+            status,
         }
     }
 
@@ -705,6 +763,7 @@ mod tests {
         }
     }
 
+    /// `last_valid` is 100 in every test; the deadline is short so stuck cases end quickly.
     fn confirm_with(chain: &Fake) -> Report {
         let kp = Keypair::new();
         let ix = solana_instruction::Instruction {
@@ -718,7 +777,16 @@ mod tests {
             Hash::default(),
         )
         .unwrap();
-        send_and_confirm(chain, &tx, 100, blank(), "x/", Duration::ZERO).unwrap()
+        send_and_confirm(
+            chain,
+            &tx,
+            100,
+            blank(),
+            "x/",
+            Duration::ZERO,
+            Duration::from_millis(200),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -756,9 +824,13 @@ mod tests {
     }
 
     #[test]
-    fn outcome_expired_when_the_blockhash_passes_unseen() {
+    fn outcome_expired_only_with_proof_from_a_current_node() {
         let chain = Fake::default();
-        chain.heights.borrow_mut().extend([Ok(10), Ok(101)]);
+        chain
+            .tips
+            .borrow_mut()
+            .extend([Ok(tip(500, 10)), Ok(tip(600, 101))]);
+        chain.history.borrow_mut().push_back(Ok(seen(600, None)));
         let r = confirm_with(&chain);
         assert_eq!(r.outcome, Outcome::Expired);
         assert_eq!(r.outcome.exit_code(), ExitCode::from(13));
@@ -768,12 +840,71 @@ mod tests {
     #[test]
     fn outcome_confirmed_when_it_lands_in_the_last_valid_block() {
         let chain = Fake::default();
-        chain.heights.borrow_mut().push_back(Ok(101));
+        chain.tips.borrow_mut().push_back(Ok(tip(600, 101)));
         chain
-            .statuses
+            .history
             .borrow_mut()
-            .extend([Ok(None), Ok(Some(landed(None)))]);
+            .push_back(Ok(seen(600, Some(landed(None)))));
         assert_eq!(confirm_with(&chain).outcome, Outcome::Confirmed);
+    }
+
+    // Pinchy's review, P1: a history lookup from a node behind the finalized tip proves nothing.
+    #[test]
+    fn a_lagging_status_node_never_proves_expiry() {
+        let chain = Fake::default();
+        chain.steady_tip.set(Some((600, 101)));
+        for _ in 0..10_000 {
+            chain.history.borrow_mut().push_back(Ok(seen(550, None)));
+        }
+        let r = confirm_with(&chain);
+        assert_eq!(r.outcome, Outcome::Unknown);
+        assert!(
+            r.detail
+                .is_some_and(|d| d.contains("look up the signature"))
+        );
+    }
+
+    // Pinchy's review, P1: an RPC error on the final status lookup is not absence.
+    #[test]
+    fn a_failed_final_lookup_is_not_expiry() {
+        let chain = Fake::default();
+        chain.steady_tip.set(Some((600, 101)));
+        for _ in 0..10_000 {
+            chain
+                .history
+                .borrow_mut()
+                .push_back(Err(RpcError::Transport("reset".into())));
+        }
+        assert_eq!(confirm_with(&chain).outcome, Outcome::Unknown);
+    }
+
+    // Pinchy's review, P1: a processed status can still be dropped; it is not "landed" on either path.
+    #[test]
+    fn a_processed_status_is_neither_landed_nor_expired() {
+        let chain = Fake::default();
+        chain.steady_tip.set(Some((600, 101)));
+        for _ in 0..10_000 {
+            chain
+                .statuses
+                .borrow_mut()
+                .push_back(Ok(Some(status("processed", None))));
+            chain
+                .history
+                .borrow_mut()
+                .push_back(Ok(seen(600, Some(status("processed", None)))));
+        }
+        assert_eq!(confirm_with(&chain).outcome, Outcome::Unknown);
+    }
+
+    // Pinchy's review, P1: a responsive RPC whose tip never moves must not hold a sign forever.
+    #[test]
+    fn a_stalled_chain_ends_at_the_deadline() {
+        let chain = Fake::default();
+        chain.steady_tip.set(Some((500, 10)));
+        let started = std::time::Instant::now();
+        let r = confirm_with(&chain);
+        assert_eq!(r.outcome, Outcome::Unknown);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -782,7 +913,7 @@ mod tests {
         let err = || RpcError::Transport("down".into());
         for _ in 0..MAX_RPC_FAILURES {
             chain.statuses.borrow_mut().push_back(Err(err()));
-            chain.heights.borrow_mut().push_back(Err(err()));
+            chain.tips.borrow_mut().push_back(Err(err()));
         }
         let r = confirm_with(&chain);
         assert_eq!(r.outcome, Outcome::Unknown);

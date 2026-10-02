@@ -21,8 +21,9 @@ use crate::payload::hex;
 use crate::rpc::Rpc;
 
 const MAX_BODY: u64 = 1024 * 1024;
-/// Inside compose's 90 s stop grace period; a sign waits at most until its blockhash expires.
-const DRAIN_DEADLINE: Duration = Duration::from_secs(80);
+/// A running sign can wait up to `engine::CONFIRM_DEADLINE` for a proven outcome; draining a little
+/// longer lets it finish. Stop grace periods (compose, systemd) must exceed this.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(engine::CONFIRM_DEADLINE.as_secs() + 10);
 const DRAIN_POLL: Duration = Duration::from_millis(100);
 const MCP_LATEST: &str = "2025-11-25";
 const MCP_VERSIONS: [&str; 3] = [MCP_LATEST, "2025-06-18", "2025-03-26"];
