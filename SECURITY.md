@@ -12,14 +12,16 @@
 | A stolen session key | On-chain scope, narrow permission mask, short expiry and a small ZINK balance. These hold even if the signer host is compromised. |
 | A stolen wallet key (Path A) | Nothing on-chain limits it. Keep only working balances in it. |
 | Another local process or a web page calls `serve` | Every route but `/health` needs a bearer token; config stores only its sha256 and the keys it may use. Host and Origin must be an allowed host. |
-| A restart mid-sign | `serve` drains running requests on SIGTERM/SIGINT (up to 80 s) before exiting; a dropped connection during `sign` means `unknown`, not failed. |
-| Double actions after a timeout | `sign` resolves to `expired` (safe to rebuild) or `unknown` (check the signature first), never a guess. |
+| A restart mid-sign | `serve` drains running requests on SIGTERM/SIGINT (up to 160 s) before exiting; a dropped connection during `sign` means `unknown`, not failed. |
+| Double actions after a timeout | `sign` reports `expired` only with proof that the transaction can no longer land (finalized height past its last valid height, and a full-history lookup from a current node finds nothing); anything less is `unknown` (check the signature first). |
+| Concurrent signs racing the limits | Signs with one key are serialized by a file lock, and every send is recorded as an intent with its simulated spend before it leaves; unresolved spends are charged that reservation. |
 
 ## Not covered
 
-- SPL Token instructions are allowed by program id, so a payload could move tokens from a token account the signing key owns. Session keys should never hold tokens.
-- A `wallet` key set to `auto` can sign a profile key grant (for example an attacker's key): the chain accepts it because the key is authorised. Keep `wallet` keys on `confirm` unless they are testnet burners.
-- The daily cap measures the fee payer's balance, not spending from the profile vault; only on-chain permissions limit that.
+- Token movement inside an allowed program (SAGE moving cargo or ATLAS by CPI) is limited only by on-chain permissions; the signer refuses direct token-program instructions but does not decode game instructions.
+- The signer does not decode what a profile grant gives away. A `wallet` key therefore cannot be `auto` or reachable through `serve` unless it sets `allow_unattended = true`; do that only for a throwaway testnet key.
+- The daily cap measures the fee payer's lamports, not token or profile-vault spending; only on-chain permissions limit those.
+- The audit log's hash chain detects edited entries, not truncation or a rewrite by someone who can write `state_dir`: keep that directory out of agents' reach, and copy the latest hash elsewhere if you need an anchor. `summary` and `intent` are caller-supplied and recorded as given; do not put secrets in them.
 
 ## Reporting
 

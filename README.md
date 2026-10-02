@@ -12,10 +12,11 @@ The signer is deliberately thin: it does not decode game instructions and needs 
 
 1. **Chain:** the RPC's genesis hash matches Z.ink testnet, so a wrong RPC URL cannot redirect signatures.
 2. **Fee payer:** the fee payer is the signing key.
-3. **Programs:** every top-level instruction calls SAGE, Player Profile, Profile Faction, ComputeBudget, SPL Token, Associated Token or System (plus per-key extras).
-4. **System Program:** account creation only for new accounts from the payload; `Transfer` only to per-key allowed destinations; nothing else.
-5. **Signers:** every required signer is the signing key or a payload partial signer, and partial signers do not exist on-chain yet.
-6. **Limits:** a per-minute rate limit and a daily lamport cap per key.
+3. **Programs:** every top-level instruction calls SAGE, Player Profile, Profile Faction, ComputeBudget, Associated Token or System (plus per-key extras).
+4. **Tokens:** SPL Token and Token-2022 are never called at the top level, even if a key lists them as extras (token movement in play happens inside SAGE); Associated Token may only create an account.
+5. **System Program:** only `Transfer`, and only to per-key allowed destinations. No account creation, assignment or allocation at the top level (forge-mcp creates new accounts inside the game programs).
+6. **Signers:** every required signer is the signing key or a payload partial signer, and partial signers do not exist on-chain yet.
+7. **Limits:** a per-minute rate limit and a daily lamport cap per key, with signs serialized per key. Each send is recorded first as an intent carrying its simulated spend; a spend whose outcome is not known is charged that reservation.
 7. **Simulation** must succeed before anything is sent.
 
 It then fetches a fresh blockhash, signs, sends, and polls until the transaction is confirmed or its blockhash has expired. Every sign request is recorded in a hash-chained audit log.
@@ -78,8 +79,8 @@ The config lives at `~/.config/sa-forge-signer/config.toml` unless `--config` or
 | `refused` | 10 | a check failed | fix the payload |
 | `simulation_failed` | 11 | the program would reject it | after fixing the cause |
 | `failed` | 12 | landed with a program error | after fixing the cause |
-| `expired` | 13 | blockhash expired without landing | yes, rebuild |
-| `unknown` | 14 | sent but not resolved | no, check the signature first |
+| `expired` | 13 | proven not landed: the finalized block height passed the blockhash's last valid height and a full-history lookup from a node at least that current found nothing | yes, rebuild |
+| `unknown` | 14 | sent but not proven either way within 150 s (or the RPC kept failing) | no, check the signature first |
 
 Payloads that carry partial signers hold private keys for new accounts; `sign` deletes such a payload file once it has been sent, and never logs them.
 
@@ -101,7 +102,7 @@ Payloads that carry partial signers hold private keys for new accounts; `sign` d
 
 Every other route needs `Authorization: Bearer <token>`. Create a token with `sa-forge-signer token new <name> --out <file>`: it writes the token to a new 0600 file and prints only its sha256 for `[[serve.tokens]]`, which also lists the keys that token may use. Host and Origin headers must name an entry in `allowed_hosts`. `confirm` keys prompt on the service's own terminal; without one they refuse.
 
-On SIGTERM or SIGINT the service stops taking requests and lets running ones finish, for up to 80 s (a sign waits at most until its blockhash expires), then exits. Give it a stop grace period of at least 90 s (for example `docker stop -t 90`). A client that loses the connection during `sign` must treat it as `unknown`: the transaction may still land.
+On SIGTERM or SIGINT the service stops taking requests and lets running ones finish, for up to 160 s (a sign waits up to 150 s for a proven outcome), then exits. Give it a stop grace period of at least 170 s (for example `docker stop -t 170`). A client that loses the connection during `sign` must treat it as `unknown`: the transaction may still land.
 
 MCP clients pass the payload object from the forge-mcp `build_*` result unchanged, and call `check` before `sign`. In a 15-payload test every payload arrived byte-exact, but the model re-types each one, so each costs its tokens twice and any partial-signer secret appears twice in the transcript.
 
