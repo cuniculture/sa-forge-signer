@@ -250,6 +250,26 @@ impl Config {
         out.extend(key.extra_programs.iter().copied());
         Ok(out)
     }
+
+    /// The allowed programs that own game state: everything but the System, token and compute
+    /// budget programs. An account they own can only be changed by game logic.
+    pub fn game_programs(&self, key: &KeyConfig) -> Result<Vec<Address>> {
+        let utility = [
+            cluster::SYSTEM_PROGRAM,
+            cluster::ASSOCIATED_TOKEN_PROGRAM,
+            cluster::TOKEN_PROGRAM,
+            cluster::TOKEN_2022_PROGRAM,
+            cluster::COMPUTE_BUDGET_PROGRAM,
+        ]
+        .iter()
+        .map(|a| parse_address("program", a))
+        .collect::<Result<Vec<_>>>()?;
+        Ok(self
+            .allowed_programs(key)?
+            .into_iter()
+            .filter(|p| !utility.contains(p))
+            .collect())
+    }
 }
 
 fn serve_from_raw(raw: RawServe, keys: &[KeyConfig]) -> Result<ServeConfig> {
@@ -344,6 +364,28 @@ mod tests {
             "a token must not grant the wallet key"
         );
         assert!(parse(&with("s")).is_ok());
+    }
+
+    #[test]
+    fn game_programs_exclude_the_utility_programs() {
+        let c = parse(&format!(
+            "[keys.s]\nclass = \"session\"\npubkey = \"{KEY}\"\n"
+        ))
+        .unwrap();
+        let games: Vec<String> = c
+            .game_programs(c.key("s").unwrap())
+            .unwrap()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            games,
+            [
+                "C4SAgeKLgb3pTLWhVr6NRwWyYFuTR7ZeSXFrzoLwfMzF",
+                "C4PRoFNroxxzdgeCoM31LJjYRg7kT6ymogSTAT99iD1u",
+                "C4FACQA1PpNRKrjQ2862ABNR42DTz7EzGj1uhTNFASwP",
+            ]
+        );
     }
 
     #[test]

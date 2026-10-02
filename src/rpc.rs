@@ -65,31 +65,20 @@ impl Status {
     }
 }
 
-/// The finalized chain tip: its slot and block height, read in one call so they agree.
-#[derive(Debug, Clone, Copy)]
-pub struct Finalized {
-    pub slot: u64,
-    pub block_height: u64,
-}
-
-/// A signature lookup that searched the node's full transaction history, with the slot the node
-/// had processed when it answered.
-pub struct HistoryStatus {
-    pub context_slot: u64,
-    pub status: Option<Status>,
-}
-
 pub struct Rpc {
     url: String,
     agent: ureq::Agent,
 }
 
 const COMMITMENT: &str = "confirmed";
+/// Longest any single RPC call may take. It bounds how far a sign can overrun its confirmation
+/// deadline (see `serve::DRAIN_DEADLINE`).
+pub const RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Rpc {
     pub fn new(url: &str) -> Self {
         let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(120)))
+            .timeout_global(Some(RPC_TIMEOUT))
             .http_status_as_error(false)
             .build();
         Self {
@@ -143,14 +132,12 @@ impl Rpc {
         Ok((hash, height))
     }
 
-    /// The finalized slot and block height. A transaction whose blockhash's last valid block
-    /// height is below the *finalized* height can no longer land on any fork.
-    pub fn finalized(&self) -> Result<Finalized> {
-        let v = self.call("getEpochInfo", &json!([{"commitment": "finalized"}]))?;
-        Ok(Finalized {
-            slot: u64_field(v.get("absoluteSlot"), "getEpochInfo absoluteSlot")?,
-            block_height: u64_field(v.get("blockHeight"), "getEpochInfo blockHeight")?,
-        })
+    /// The finalized block height, as this answering node sees it. Past a blockhash's last valid
+    /// height, waiting longer cannot change the outcome; it is not, by itself, proof of absence.
+    pub fn finalized_height(&self) -> Result<u64> {
+        let v = self.call("getBlockHeight", &json!([{"commitment": "finalized"}]))?;
+        v.as_u64()
+            .ok_or_else(|| RpcError::Shape("getBlockHeight: not a number".to_owned()))
     }
 
     pub fn balance(&self, address: &Address) -> Result<u64> {
@@ -163,6 +150,15 @@ impl Rpc {
 
     /// Whether each account exists on-chain.
     pub fn accounts_exist(&self, addresses: &[Address]) -> Result<Vec<bool>> {
+        Ok(self
+            .account_owners(addresses)?
+            .iter()
+            .map(Option::is_some)
+            .collect())
+    }
+
+    /// The owning program of each account, or `None` where it does not exist.
+    pub fn account_owners(&self, addresses: &[Address]) -> Result<Vec<Option<Address>>> {
         if addresses.is_empty() {
             return Ok(Vec::new());
         }
@@ -176,7 +172,18 @@ impl Rpc {
         if list.len() != addresses.len() {
             return Err(RpcError::Shape("getMultipleAccounts: length".to_owned()));
         }
-        Ok(list.iter().map(|a| !a.is_null()).collect())
+        list.iter()
+            .map(|a| {
+                if a.is_null() {
+                    return Ok(None);
+                }
+                a.get("owner")
+                    .and_then(Value::as_str)
+                    .and_then(|o| Address::from_str(o).ok())
+                    .map(Some)
+                    .ok_or_else(|| RpcError::Shape("getMultipleAccounts: owner".to_owned()))
+            })
+            .collect()
     }
 
     pub fn fee_for_message(&self, message_b64: &str) -> Result<Option<u64>> {
@@ -245,20 +252,13 @@ impl Rpc {
         status_of(&v)
     }
 
-    /// Like `signature_status`, but searching the full transaction history, and returning the
-    /// slot the answering node had reached, so an absence can be checked against a known tip.
-    pub fn signature_status_history(&self, signature: &str) -> Result<HistoryStatus> {
+    /// Like `signature_status`, but searching the node's full transaction history.
+    pub fn signature_status_history(&self, signature: &str) -> Result<Option<Status>> {
         let v = self.call(
             "getSignatureStatuses",
             &json!([[signature], {"searchTransactionHistory": true}]),
         )?;
-        Ok(HistoryStatus {
-            context_slot: u64_field(
-                v.get("context").and_then(|c| c.get("slot")),
-                "getSignatureStatuses context.slot",
-            )?,
-            status: status_of(&v)?,
-        })
+        status_of(&v)
     }
 }
 
@@ -287,8 +287,8 @@ fn status_of(v: &Value) -> Result<Option<Status>> {
 pub trait Chain {
     fn send(&self, tx_b64: &str) -> Result<String>;
     fn signature_status(&self, signature: &str) -> Result<Option<Status>>;
-    fn signature_status_history(&self, signature: &str) -> Result<HistoryStatus>;
-    fn finalized(&self) -> Result<Finalized>;
+    fn signature_status_history(&self, signature: &str) -> Result<Option<Status>>;
+    fn finalized_height(&self) -> Result<u64>;
     fn transaction_meta(&self, signature: &str) -> Result<Option<TxMeta>>;
 }
 
@@ -299,11 +299,11 @@ impl Chain for Rpc {
     fn signature_status(&self, signature: &str) -> Result<Option<Status>> {
         Self::signature_status(self, signature)
     }
-    fn signature_status_history(&self, signature: &str) -> Result<HistoryStatus> {
+    fn signature_status_history(&self, signature: &str) -> Result<Option<Status>> {
         Self::signature_status_history(self, signature)
     }
-    fn finalized(&self) -> Result<Finalized> {
-        Self::finalized(self)
+    fn finalized_height(&self) -> Result<u64> {
+        Self::finalized_height(self)
     }
     fn transaction_meta(&self, signature: &str) -> Result<Option<TxMeta>> {
         Self::transaction_meta(self, signature)

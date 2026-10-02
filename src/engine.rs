@@ -32,10 +32,9 @@ pub enum Outcome {
     Confirmed,
     /// Landed with a program error.
     Failed,
-    /// Proven not landed: the finalized block height passed the blockhash's last valid height and
-    /// a full-history lookup from a node at least that current found no trace. Safe to rebuild.
-    Expired,
-    /// Sent but not resolved; check the signature before retrying.
+    /// Sent but not proven landed. This includes a transaction whose blockhash has expired with
+    /// no status found: through an RPC that may answer from several nodes, absence is never
+    /// proof that it did not land. Reconcile the signature and the on-chain state before retrying.
     Unknown,
 }
 
@@ -46,7 +45,7 @@ impl Outcome {
             Self::Refused => 10,
             Self::SimulationFailed => 11,
             Self::Failed => 12,
-            Self::Expired => 13,
+            // 13 was `expired`, which the signer no longer reports (see `Unknown`).
             Self::Unknown => 14,
         })
     }
@@ -249,13 +248,50 @@ fn preflight(
         )));
     }
     passed.push("new_accounts");
+    if let Err(r) = ata_owners(cfg, rpc, key, &message, &policy)? {
+        return Ok(Err(r));
+    }
+    passed.push("ata_owners");
     if signing {
+        // An early refusal only; the binding check is `within_cap` after the final simulation.
         if let Err(r) = limits(&Audit::new(&cfg.state_dir).entries()?, key, now()) {
             return Ok(Err(r));
         }
         passed.push("limits");
     }
     Ok(Ok((message, blockhash, last_valid)))
+}
+
+/// An associated token account created for an owner other than the signing key or its transfer
+/// destinations must belong to a game account: an account owned by one of the key's game programs
+/// (a character, a cargo cache). Its rent then stays where only game logic can move it, rather than
+/// in a wallet the requester could close the account from and reclaim the rent.
+fn ata_owners(
+    cfg: &Config,
+    rpc: &Rpc,
+    key: &KeyConfig,
+    message: &Message,
+    policy: &Policy<'_>,
+) -> Result<Result<(), Refusal>> {
+    let owners = match checks::ata_owners(message, policy) {
+        Ok(o) => o,
+        Err(r) => return Ok(Err(r)),
+    };
+    if owners.is_empty() {
+        return Ok(Ok(()));
+    }
+    let games = cfg.game_programs(key)?;
+    for (who, program) in owners.iter().zip(rpc.account_owners(&owners)?) {
+        if !program.is_some_and(|p| games.contains(&p)) {
+            return Ok(Err(refusal(
+                "ata_owners",
+                format!(
+                    "a token account would be created for {who}, which is neither this key, one of its transfer destinations, nor an account of a game program"
+                ),
+            )));
+        }
+    }
+    Ok(Ok(()))
 }
 
 fn pipeline(
@@ -329,8 +365,15 @@ fn pipeline(
         (tx, last_valid)
     };
     report.checks.push("approval");
+    // The cap binds here, under the key lock, against the simulation of the exact transaction
+    // about to be sent: what is already spent or reserved plus this transaction's own spend.
+    let reserve = match cap_gate(&Audit::new(&cfg.state_dir).entries()?, key, &report, now()) {
+        Ok(r) => r,
+        Err(r) => return Ok((report.refused(&r), false)),
+    };
+    report.checks.push("cap");
     // Durable before anything is sent: if this process dies mid-confirmation, the intent (with
-    // its simulated spend as a reservation) is what the limits and the operator see.
+    // this transaction's reservation) is what the limits and the operator see.
     Audit::new(&cfg.state_dir).append(Entry {
         ts: now(),
         key: key.name.clone(),
@@ -344,7 +387,7 @@ fn pipeline(
         },
         outcome: "pending".to_owned(),
         signature: tx.signatures.first().map(ToString::to_string),
-        balance_change: report.balance_change,
+        balance_change: Some(0_i64.saturating_sub_unsigned(reserve)),
         ..Entry::default()
     })?;
     let explorer = cfg.cluster.explorer_tx;
@@ -383,11 +426,10 @@ fn send_and_confirm(
     }
     let mut failures: u32 = 0;
     let mut polls: u32 = 0;
-    // A landed status (confirmed or finalized) ends the wait from either lookup. `Expired` needs
-    // proof, never mere silence: the finalized height must be past last_valid (no fork can still
-    // include the transaction), and a full-history lookup from a node at least as far as that
-    // finalized slot must find nothing. An error, a lagging node, or a merely processed status is
-    // not proof; the loop keeps waiting and, at the deadline, reports `unknown`.
+    // A landed status (confirmed or finalized) ends the wait from either lookup. Nothing proves
+    // the opposite: once the finalized height is past last_valid, waiting cannot change the
+    // outcome, but an empty status may come from a node other than the one that reported the
+    // height, or one with incomplete history. So that ends the wait as `unknown`, never `expired`.
     report.outcome = loop {
         std::thread::sleep(poll);
         polls = polls.saturating_add(1);
@@ -396,27 +438,30 @@ fn send_and_confirm(
             Ok(_) => {}
             Err(e) => failures = note_failure(failures, &mut report, &e),
         }
-        match chain.finalized() {
-            Ok(tip) if tip.block_height > last_valid => {
-                match chain.signature_status_history(&signature) {
-                    Ok(h) => match h.status {
-                        Some(st) if st.landed() => break landed_outcome(&mut report, st),
-                        None if h.context_slot >= tip.slot => break Outcome::Expired,
-                        // Processed but unconfirmed, or a node behind the finalized tip.
-                        _ => {}
-                    },
-                    Err(e) => failures = note_failure(failures, &mut report, &e),
+        match chain.finalized_height() {
+            Ok(height) if height > last_valid => match chain.signature_status_history(&signature) {
+                Ok(Some(st)) if st.landed() => break landed_outcome(&mut report, st),
+                Ok(_) => {
+                    report.detail = Some(format!(
+                        "blockhash expired (finalized height {height} is past {last_valid}) and the RPC reports no landed status; that does not prove it never landed: look up the signature and check the on-chain state before retrying"
+                    ));
+                    break Outcome::Unknown;
                 }
-            }
+                Err(e) => failures = note_failure(failures, &mut report, &e),
+            },
             Ok(_) => {}
             Err(e) => failures = note_failure(failures, &mut report, &e),
         }
         if failures >= MAX_RPC_FAILURES {
+            report.detail = Some(format!(
+                "{}; look up the signature and check the on-chain state before retrying",
+                report.detail.as_deref().unwrap_or("RPC failures")
+            ));
             break Outcome::Unknown;
         }
         if started.elapsed() >= deadline {
             report.detail = Some(format!(
-                "no proven outcome within {}s; look up the signature before retrying",
+                "no proven outcome within {}s; look up the signature and check the on-chain state before retrying",
                 deadline.as_secs()
             ));
             break Outcome::Unknown;
@@ -428,7 +473,11 @@ fn send_and_confirm(
     report.balance_change = None;
     if matches!(report.outcome, Outcome::Confirmed | Outcome::Failed) {
         // This transaction's own effect; a balance diff would include parallel transactions.
+        // Bounded by the same deadline; without metadata the intent's reservation is charged.
         for _ in 0..META_ATTEMPTS {
+            if started.elapsed() >= deadline {
+                break;
+            }
             if let Ok(Some(meta)) = chain.transaction_meta(&signature) {
                 report.balance_change = meta.payer_change;
                 report.fee = meta.fee.or(report.fee);
@@ -457,6 +506,7 @@ fn landed_outcome(report: &mut Report, st: Status) -> Outcome {
 
 /// The two calls a fresh rebuild needs; a trait so the rebuild can be tested without a node.
 pub trait Fresh {
+    fn balance(&self, address: &solana_address::Address) -> std::result::Result<u64, RpcError>;
     fn latest_blockhash(&self) -> std::result::Result<(Hash, u64), RpcError>;
     fn simulate_signed(
         &self,
@@ -466,6 +516,9 @@ pub trait Fresh {
 }
 
 impl Fresh for Rpc {
+    fn balance(&self, address: &solana_address::Address) -> std::result::Result<u64, RpcError> {
+        Self::balance(self, address)
+    }
     fn latest_blockhash(&self) -> std::result::Result<(Hash, u64), RpcError> {
         Self::latest_blockhash(self)
     }
@@ -479,8 +532,9 @@ impl Fresh for Rpc {
 }
 
 /// Approval can outlast a blockhash, so the approved instructions are re-signed with a fresh one
-/// and that exact transaction is simulated before it may be sent: it is new bytes. A failure
-/// comes back as the report to return (`SimulationFailed`, nothing sent).
+/// and that exact transaction is simulated before it may be sent: it is new bytes. Its own
+/// simulated spend replaces the earlier one, so the cap check and the reservation see what is
+/// sent. A failure comes back as the report to return (`SimulationFailed`, nothing sent).
 fn after_approval(
     chain: &impl Fresh,
     payload: &Payload,
@@ -488,7 +542,15 @@ fn after_approval(
     payer: &solana_address::Address,
     mut report: Report,
 ) -> Result<std::result::Result<(Transaction, u64, Report), Report>> {
+    let pre = chain.balance(payer)?;
     let (tx, last_valid, sim) = fresh_simulated(chain, payload, signers, payer)?;
+    report.compute_units = sim.units;
+    report.balance_change = sim
+        .post_lamports
+        .first()
+        .copied()
+        .flatten()
+        .and_then(|post| delta(pre, post));
     if let Some(err) = sim.err {
         report.outcome = Outcome::SimulationFailed;
         report.program_error = program_error(&sim.logs);
@@ -589,8 +651,8 @@ fn confirm(report: &Report, key: &KeyConfig) -> Result<bool> {
 /// (confirmed or failed, with metadata). When it is not known (the outcome is unknown, the
 /// metadata never arrived, or the process died), the intent's simulated spend is charged as a
 /// reservation, and with no simulation figure the whole daily cap is: an unresolved transaction
-/// may have landed, so it is never free.
-fn limits(entries: &[Entry], key: &KeyConfig, now: u64) -> Result<(), Refusal> {
+/// may have landed, so it is never free. Returns the lamports spent or reserved in the last 24 h.
+fn limits(entries: &[Entry], key: &KeyConfig, now: u64) -> Result<u64, Refusal> {
     let mine: Vec<&Entry> = entries.iter().filter(|e| e.key == key.name).collect();
     let finals = || mine.iter().filter(|e| e.command == "sign");
     let resolved = |sig: &str| finals().any(|e| e.signature.as_deref() == Some(sig));
@@ -626,8 +688,9 @@ fn limits(entries: &[Entry], key: &KeyConfig, now: u64) -> Result<(), Refusal> {
             "confirmed" | "failed" => e
                 .balance_change
                 .map_or_else(|| reservation(e.signature.as_deref()), spend),
-            "unknown" => reservation(e.signature.as_deref()),
-            // Proven not landed, or never sent.
+            // `expired` appears only in older logs, from a proof that could be wrong.
+            "unknown" | "expired" => reservation(e.signature.as_deref()),
+            // Refused or failed simulation: never sent.
             _ => 0,
         };
         spent = spent.saturating_add(cost);
@@ -639,6 +702,42 @@ fn limits(entries: &[Entry], key: &KeyConfig, now: u64) -> Result<(), Refusal> {
         return Err(refusal(
             "limits",
             format!("daily cap: {spent} of {cap} lamports spent or reserved in 24 h"),
+        ));
+    }
+    Ok(spent)
+}
+
+/// The final limit check, made under the key lock against the simulation of the exact
+/// transaction about to be sent. Returns that transaction's reservation.
+fn cap_gate(entries: &[Entry], key: &KeyConfig, report: &Report, now: u64) -> Result<u64, Refusal> {
+    let reserve = reservation(report).ok_or_else(|| {
+        refusal(
+            "limits",
+            "the simulation did not report this key's balance, so the spend cannot be bounded"
+                .to_owned(),
+        )
+    })?;
+    within_cap(limits(entries, key, now)?, reserve, key.daily_lamport_cap)?;
+    Ok(reserve)
+}
+
+/// This transaction's reservation: its simulated spend plus the fee, when the simulation reported
+/// the key's balance.
+fn reservation(report: &Report) -> Option<u64> {
+    report
+        .balance_change
+        .map(|d| spend(d).saturating_add(report.fee.unwrap_or(0)))
+}
+
+/// Refuses a transaction whose reservation would take the 24 h total past the cap.
+fn within_cap(spent: u64, reserve: u64, cap: u64) -> Result<(), Refusal> {
+    let total = spent.saturating_add(reserve);
+    if total > cap {
+        return Err(refusal(
+            "limits",
+            format!(
+                "daily cap: {spent} lamports spent or reserved in 24 h, plus {reserve} for this transaction, exceeds {cap}"
+            ),
         ));
     }
     Ok(())
@@ -789,13 +888,16 @@ mod tests {
         // No simulated figure to reserve: the whole cap is charged.
         let blind = [intent(10, "a", None)];
         assert!(limits(&blind, &k, 100).is_err());
-        // Proven not landed: nothing is charged.
+        // `expired` from an older log rested on a proof that could be wrong: charged too.
         let expired = [
             intent(10, "a", Some(-600)),
             sign_final(11, "a", "expired", None),
             entry(12, -500),
         ];
-        assert!(limits(&expired, &k, 100).is_ok());
+        assert!(limits(&expired, &k, 100).is_err());
+        // Never sent: nothing is charged.
+        let refused = [sign_final(11, "a", "refused", None), entry(12, -500)];
+        assert_eq!(limits(&refused, &k, 100), Ok(500));
         // Known cost replaces the reservation.
         let known = [
             intent(10, "a", Some(-600)),
@@ -803,6 +905,40 @@ mod tests {
             entry(12, -500),
         ];
         assert!(limits(&known, &k, 100).is_ok());
+    }
+
+    fn simulated(change: Option<i64>, fee: Option<u64>) -> Report {
+        Report {
+            balance_change: change,
+            fee,
+            ..blank()
+        }
+    }
+
+    // Pinchy's re-review, P1-2: the cap must count the transaction about to be sent.
+    #[test]
+    fn the_cap_counts_the_transaction_about_to_be_sent() {
+        let k = KeyConfig {
+            daily_lamport_cap: 50_000_000,
+            ..roomy()
+        };
+        let past = [entry(10, -49_000_000)];
+        // Pinchy's example: 49M spent, a 40M spend would end at 89M.
+        let r = cap_gate(&past, &k, &simulated(Some(-40_000_000), None), 100).unwrap_err();
+        assert!(r.detail.contains("40000000 for this transaction"), "{r}");
+        // Exactly reaching the cap is allowed; one lamport more is not.
+        assert_eq!(
+            cap_gate(&past, &k, &simulated(Some(-995_000), Some(5_000)), 100),
+            Ok(1_000_000)
+        );
+        assert!(cap_gate(&past, &k, &simulated(Some(-995_001), Some(5_000)), 100).is_err());
+        // No simulated balance: the spend cannot be bounded, so nothing is signed.
+        assert!(cap_gate(&[], &k, &simulated(None, Some(5_000)), 100).is_err());
+        // A gain spends only the fee.
+        assert_eq!(
+            cap_gate(&[], &k, &simulated(Some(10), Some(5_000)), 100),
+            Ok(5_000)
+        );
     }
 
     #[test]
@@ -899,7 +1035,7 @@ mod tests {
         assert_eq!(program_error(&logs(&["Program X success"])), None);
     }
 
-    use crate::rpc::{Finalized, HistoryStatus, Simulation, Status, TxMeta};
+    use crate::rpc::{Simulation, Status, TxMeta};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
@@ -909,10 +1045,10 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         statuses: RefCell<VecDeque<R<Option<Status>>>>,
-        history: RefCell<VecDeque<R<HistoryStatus>>>,
-        tips: RefCell<VecDeque<R<Finalized>>>,
-        /// Repeated once `tips` is empty (default: height 0, never past `last_valid`).
-        steady_tip: Cell<Option<(u64, u64)>>,
+        history: RefCell<VecDeque<R<Option<Status>>>>,
+        tips: RefCell<VecDeque<R<u64>>>,
+        /// Finalized height repeated once `tips` is empty (default 0, never past `last_valid`).
+        steady_tip: Cell<u64>,
         meta: RefCell<Option<TxMeta>>,
         sends: Cell<u32>,
     }
@@ -925,20 +1061,14 @@ mod tests {
         fn signature_status(&self, _: &str) -> R<Option<Status>> {
             self.statuses.borrow_mut().pop_front().unwrap_or(Ok(None))
         }
-        fn signature_status_history(&self, _: &str) -> R<HistoryStatus> {
-            self.history
+        fn signature_status_history(&self, _: &str) -> R<Option<Status>> {
+            self.history.borrow_mut().pop_front().unwrap_or(Ok(None))
+        }
+        fn finalized_height(&self) -> R<u64> {
+            self.tips
                 .borrow_mut()
                 .pop_front()
-                .unwrap_or(Ok(HistoryStatus {
-                    context_slot: 0,
-                    status: None,
-                }))
-        }
-        fn finalized(&self) -> R<Finalized> {
-            self.tips.borrow_mut().pop_front().unwrap_or_else(|| {
-                let (slot, block_height) = self.steady_tip.get().unwrap_or((0, 0));
-                Ok(Finalized { slot, block_height })
-            })
+                .unwrap_or_else(|| Ok(self.steady_tip.get()))
         }
         fn transaction_meta(&self, _: &str) -> R<Option<TxMeta>> {
             Ok(self.meta.borrow_mut().take())
@@ -955,17 +1085,6 @@ mod tests {
 
     fn landed(err: Option<Value>) -> Status {
         status("confirmed", err)
-    }
-
-    const fn tip(slot: u64, block_height: u64) -> Finalized {
-        Finalized { slot, block_height }
-    }
-
-    const fn seen(context_slot: u64, status: Option<Status>) -> HistoryStatus {
-        HistoryStatus {
-            context_slot,
-            status,
-        }
     }
 
     fn meta(logs: &[&str]) -> TxMeta {
@@ -1058,38 +1177,47 @@ mod tests {
         assert!(r.error.is_some());
     }
 
+    // Pinchy's re-review, P1-1: behind a load balancer, node A can report a finalized height past
+    // last_valid while node B, with an older root or incomplete history, finds no status for a
+    // transaction that landed on A's chain. No pair of answers like that may become `expired`.
     #[test]
-    fn outcome_expired_only_with_proof_from_a_current_node() {
+    fn an_expired_blockhash_with_no_status_is_unknown_not_expired() {
         let chain = Fake::default();
-        chain
-            .tips
-            .borrow_mut()
-            .extend([Ok(tip(500, 10)), Ok(tip(600, 101))]);
-        chain.history.borrow_mut().push_back(Ok(seen(600, None)));
+        chain.tips.borrow_mut().extend([Ok(10), Ok(101)]);
+        chain.history.borrow_mut().push_back(Ok(None));
+        let started = std::time::Instant::now();
         let r = confirm_with(&chain);
-        assert_eq!(r.outcome, Outcome::Expired);
-        assert_eq!(r.outcome.exit_code(), ExitCode::from(13));
+        assert_eq!(r.outcome, Outcome::Unknown);
+        assert_eq!(r.outcome.exit_code(), ExitCode::from(14));
+        assert!(
+            r.detail
+                .is_some_and(|d| d.contains("does not prove it never landed"))
+        );
         assert_eq!(r.balance_change, None);
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "past last_valid, waiting cannot help: it ends at once"
+        );
     }
 
     #[test]
     fn outcome_confirmed_when_it_lands_in_the_last_valid_block() {
         let chain = Fake::default();
-        chain.tips.borrow_mut().push_back(Ok(tip(600, 101)));
-        chain
-            .history
-            .borrow_mut()
-            .push_back(Ok(seen(600, Some(landed(None)))));
+        chain.tips.borrow_mut().push_back(Ok(101));
+        chain.history.borrow_mut().push_back(Ok(Some(landed(None))));
         assert_eq!(confirm_with(&chain).outcome, Outcome::Confirmed);
     }
 
-    // Pinchy's review, P1: a history lookup from a node behind the finalized tip proves nothing.
+    // Pinchy's review, P1: an RPC error on the final status lookup is not absence.
     #[test]
-    fn a_lagging_status_node_never_proves_expiry() {
+    fn a_failed_final_lookup_is_not_expiry() {
         let chain = Fake::default();
-        chain.steady_tip.set(Some((600, 101)));
+        chain.steady_tip.set(101);
         for _ in 0..10_000 {
-            chain.history.borrow_mut().push_back(Ok(seen(550, None)));
+            chain
+                .history
+                .borrow_mut()
+                .push_back(Err(RpcError::Transport("reset".into())));
         }
         let r = confirm_with(&chain);
         assert_eq!(r.outcome, Outcome::Unknown);
@@ -1099,25 +1227,11 @@ mod tests {
         );
     }
 
-    // Pinchy's review, P1: an RPC error on the final status lookup is not absence.
+    // Pinchy's review, P1: a processed status can still be dropped; it is not "landed".
     #[test]
-    fn a_failed_final_lookup_is_not_expiry() {
+    fn a_processed_status_is_not_landed() {
         let chain = Fake::default();
-        chain.steady_tip.set(Some((600, 101)));
-        for _ in 0..10_000 {
-            chain
-                .history
-                .borrow_mut()
-                .push_back(Err(RpcError::Transport("reset".into())));
-        }
-        assert_eq!(confirm_with(&chain).outcome, Outcome::Unknown);
-    }
-
-    // Pinchy's review, P1: a processed status can still be dropped; it is not "landed" on either path.
-    #[test]
-    fn a_processed_status_is_neither_landed_nor_expired() {
-        let chain = Fake::default();
-        chain.steady_tip.set(Some((600, 101)));
+        chain.steady_tip.set(101);
         for _ in 0..10_000 {
             chain
                 .statuses
@@ -1126,7 +1240,7 @@ mod tests {
             chain
                 .history
                 .borrow_mut()
-                .push_back(Ok(seen(600, Some(status("processed", None)))));
+                .push_back(Ok(Some(status("processed", None))));
         }
         assert_eq!(confirm_with(&chain).outcome, Outcome::Unknown);
     }
@@ -1135,7 +1249,7 @@ mod tests {
     #[test]
     fn a_stalled_chain_ends_at_the_deadline() {
         let chain = Fake::default();
-        chain.steady_tip.set(Some((500, 10)));
+        chain.steady_tip.set(10);
         let started = std::time::Instant::now();
         let r = confirm_with(&chain);
         assert_eq!(r.outcome, Outcome::Unknown);
@@ -1147,10 +1261,26 @@ mod tests {
     struct Rebuild {
         hash: Hash,
         sim_err: Option<Value>,
+        /// The key's balance before, and as simulated after, the rebuilt transaction.
+        lamports: (u64, Option<u64>),
         simulated: RefCell<Vec<String>>,
     }
 
+    impl Rebuild {
+        fn new(sim_err: Option<Value>, lamports: (u64, Option<u64>)) -> Self {
+            Self {
+                hash: Hash::new_from_array([5; 32]),
+                sim_err,
+                lamports,
+                simulated: RefCell::new(vec![]),
+            }
+        }
+    }
+
     impl Fresh for Rebuild {
+        fn balance(&self, _: &Address) -> R<u64> {
+            Ok(self.lamports.0)
+        }
         fn latest_blockhash(&self) -> R<(Hash, u64)> {
             Ok((self.hash.clone(), 777))
         }
@@ -1160,7 +1290,7 @@ mod tests {
                 err: self.sim_err.clone(),
                 logs: vec!["Program log: Error: would fail".into()],
                 units: Some(1),
-                post_lamports: vec![],
+                post_lamports: vec![self.lamports.1],
             })
         }
     }
@@ -1181,11 +1311,7 @@ mod tests {
     fn after_approval_sends_only_the_transaction_it_simulated() {
         let payer = Keypair::new();
         let payload = approved_payload(&payer);
-        let node = Rebuild {
-            hash: Hash::new_from_array([5; 32]),
-            sim_err: None,
-            simulated: RefCell::new(vec![]),
-        };
+        let node = Rebuild::new(None, (1_000, Some(990)));
         let (tx, last_valid, _) =
             after_approval(&node, &payload, &[&payer], &payer.pubkey(), blank())
                 .unwrap()
@@ -1202,15 +1328,35 @@ mod tests {
         );
     }
 
+    // Pinchy's re-review, P2: the reservation and the cap check use the rebuilt transaction's own
+    // simulated spend, not the one shown at approval.
+    #[test]
+    fn after_approval_replaces_the_simulated_spend() {
+        let payer = Keypair::new();
+        let payload = approved_payload(&payer);
+        // blank() carries an approval-time spend of -1.
+        let spent = Rebuild::new(None, (1_000, Some(400)));
+        let (_, _, r) = after_approval(&spent, &payload, &[&payer], &payer.pubkey(), blank())
+            .unwrap()
+            .unwrap();
+        assert_eq!((r.balance_change, r.compute_units), (Some(-600), Some(1)));
+        // No balance in the new simulation: nothing stale is kept, so `cap_gate` refuses.
+        let blind = Rebuild::new(None, (1_000, None));
+        let (_, _, r) = after_approval(&blind, &payload, &[&payer], &payer.pubkey(), blank())
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.balance_change, None);
+        assert!(cap_gate(&[], &roomy(), &r, 100).is_err());
+    }
+
     #[test]
     fn after_approval_refuses_to_send_when_the_new_simulation_fails() {
         let payer = Keypair::new();
         let payload = approved_payload(&payer);
-        let node = Rebuild {
-            hash: Hash::new_from_array([5; 32]),
-            sim_err: Some(serde_json::json!({"InstructionError": [0, {"Custom": 7}]})),
-            simulated: RefCell::new(vec![]),
-        };
+        let node = Rebuild::new(
+            Some(serde_json::json!({"InstructionError": [0, {"Custom": 7}]})),
+            (1_000, Some(990)),
+        );
         let report = after_approval(&node, &payload, &[&payer], &payer.pubkey(), blank())
             .unwrap()
             .unwrap_err();

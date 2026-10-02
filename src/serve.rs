@@ -18,14 +18,18 @@ use zeroize::Zeroizing;
 use crate::config::{Config, ServeConfig, TokenConfig};
 use crate::engine::{self, Mode, Outcome};
 use crate::payload::hex;
-use crate::rpc::Rpc;
+use crate::rpc::{RPC_TIMEOUT, Rpc};
 
 const MAX_BODY: u64 = 1024 * 1024;
 /// Requests handled at once; beyond this the accept loop answers 503 instead of spawning threads.
 const MAX_IN_FLIGHT: usize = 32;
-/// A running sign can wait up to `engine::CONFIRM_DEADLINE` for a proven outcome; draining a little
-/// longer lets it finish. Stop grace periods (compose, systemd) must exceed this.
-const DRAIN_DEADLINE: Duration = Duration::from_secs(engine::CONFIRM_DEADLINE.as_secs() + 10);
+/// A running sign waits up to `engine::CONFIRM_DEADLINE` for a proven outcome, and the poll that
+/// crosses it can still make four RPC calls of up to `RPC_TIMEOUT` each. This covers the typical
+/// case, not a hard worst case: the checks and simulations before sending also make RPC calls,
+/// and a stalled RPC can stretch them too. Stop grace periods (compose, systemd) must exceed it.
+/// A sign cut off anyway has its intent recorded; its signature must be reconciled.
+const DRAIN_DEADLINE: Duration =
+    Duration::from_secs(engine::CONFIRM_DEADLINE.as_secs() + 4 * RPC_TIMEOUT.as_secs() + 10);
 const DRAIN_POLL: Duration = Duration::from_millis(100);
 const MCP_LATEST: &str = "2025-11-25";
 const MCP_VERSIONS: [&str; 3] = [MCP_LATEST, "2025-06-18", "2025-03-26"];
@@ -318,7 +322,8 @@ fn initialize(params: &Value) -> Value {
         "serverInfo": {"name": "sa-forge-signer", "version": env!("CARGO_PKG_VERSION")},
         "instructions": "Signs SAGE C4 payloads built by forge-mcp. Pass the payload object from a build_* call unchanged. \
             `check` runs every check and a simulation without signing; `sign` checks, simulates, signs, sends and confirms. \
-            The result is a JSON report: act on `outcome` (never resend on `unknown`; rebuild on `expired`, which the signer reports only with proof that it can no longer land).",
+            The result is a JSON report: act on `outcome`. On `unknown`, an HTTP error or a dropped connection, the transaction may still have landed: \
+            look up the reported signature and re-read the game state the action was meant to change before building it again.",
     })
 }
 

@@ -42,6 +42,9 @@ const SYS_TRANSFER: u32 = 2;
 // payer, owned by the token program). RecoverNested (2) moves tokens and is refused.
 const ATA_CREATE: u8 = 0;
 const ATA_CREATE_IDEMPOTENT: u8 = 1;
+// Account positions in both create forms: payer, new account, owner (wallet), mint, system, token.
+const ATA_OWNER: usize = 2;
+const ATA_ACCOUNTS: usize = 6;
 
 /// Runs every check that needs only the message; returns the names of the checks passed.
 pub fn structural(message: &Message, policy: &Policy<'_>) -> Result<Vec<&'static str>, Refusal> {
@@ -113,6 +116,33 @@ fn tokens(message: &Message) -> Result<(), Refusal> {
         }
     }
     Ok(())
+}
+
+/// The owners of associated token accounts the message creates, other than the signing key and its
+/// transfer destinations. Each is a rent recipient no destination rule covers, so the caller must
+/// check it on-chain (see `engine::ata_owners`).
+pub fn ata_owners(message: &Message, policy: &Policy<'_>) -> Result<Vec<Address>, Refusal> {
+    let ata = Address::from_str(ASSOCIATED_TOKEN_PROGRAM)
+        .map_err(|e| refuse("ata_owners", e.to_string()))?;
+    let mut out: Vec<Address> = Vec::new();
+    for (i, ix) in message.instructions.iter().enumerate() {
+        if program_of(message, ix) != Some(&ata) {
+            continue;
+        }
+        let owner = (ix.accounts.len() >= ATA_ACCOUNTS)
+            .then(|| account_of(message, ix, ATA_OWNER))
+            .flatten()
+            .ok_or_else(|| {
+                refuse(
+                    "ata_owners",
+                    format!("instruction {i} is missing associated-token accounts"),
+                )
+            })?;
+        if owner != policy.signer && !policy.transfer_to.contains(owner) && !out.contains(owner) {
+            out.push(*owner);
+        }
+    }
+    Ok(out)
 }
 
 fn system(message: &Message, policy: &Policy<'_>) -> Result<(), Refusal> {
@@ -378,6 +408,55 @@ mod tests {
                 "ATA instruction {data:?} must be refused"
             );
         }
+    }
+
+    fn ata_create(owner: Address) -> Instruction {
+        Instruction {
+            program_id: Address::from_str(ASSOCIATED_TOKEN_PROGRAM).unwrap(),
+            accounts: vec![
+                AccountMeta::new(addr(1), true),
+                AccountMeta::new(addr(20), false),
+                AccountMeta::new_readonly(owner, false),
+                AccountMeta::new_readonly(addr(21), false),
+                AccountMeta::new_readonly(Address::from_str(SYSTEM_PROGRAM).unwrap(), false),
+                AccountMeta::new_readonly(Address::from_str(TOKEN_PROGRAM).unwrap(), false),
+            ],
+            data: vec![ATA_CREATE_IDEMPOTENT],
+        }
+    }
+
+    fn owners_to_verify(ixs: &[Instruction], to: &[Address]) -> Result<Vec<Address>, Refusal> {
+        ata_owners(
+            &Message::new(ixs, Some(&addr(1))),
+            &Policy {
+                signer: &addr(1),
+                allowed_programs: &[],
+                transfer_to: to,
+                partial_signers: &[],
+            },
+        )
+    }
+
+    // Pinchy's re-review, P1-3: creating a token account pays its rent to whoever owns it. The
+    // signing key and its transfer destinations are covered already; any other owner is returned
+    // for the on-chain game-account check, once even if repeated.
+    #[test]
+    fn ata_owners_other_than_the_key_and_its_destinations_need_checking() {
+        assert_eq!(owners_to_verify(&[ata_create(addr(1))], &[]), Ok(vec![]));
+        assert_eq!(
+            owners_to_verify(&[ata_create(addr(3))], &[addr(3)]),
+            Ok(vec![])
+        );
+        assert_eq!(
+            owners_to_verify(&[ata_create(addr(7)), ata_create(addr(7)), game_ix()], &[]),
+            Ok(vec![addr(7)])
+        );
+        let mut short = ata_create(addr(7));
+        short.accounts.truncate(2);
+        assert_eq!(
+            owners_to_verify(&[short], &[]).unwrap_err().check,
+            "ata_owners"
+        );
     }
 
     #[test]
