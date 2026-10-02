@@ -20,7 +20,7 @@ use crate::checks::{self, Policy, Refusal, refuse as refusal};
 use crate::config::{Approval, Config, KeyConfig};
 use crate::keystore::KeyStore;
 use crate::payload::Payload;
-use crate::rpc::{Chain, Rpc, RpcError, Status, delta};
+use crate::rpc::{Chain, Rpc, RpcError, Simulation, Status, delta};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -275,12 +275,7 @@ fn pipeline(
     let mut sim = rpc.simulate(&encode(&tx)?, signing, &[key.pubkey])?;
     // A slow preflight can outlive the blockhash on the simulating node; every key is here, so re-sign once.
     if signing && sim.err.as_ref().and_then(Value::as_str) == Some("BlockhashNotFound") {
-        let (hash, valid) = rpc.latest_blockhash()?;
-        let fresh =
-            Message::new_with_blockhash(&payload.instructions, Some(&payload.fee_payer), &hash);
-        tx = build(fresh, &signers, hash)?;
-        last_valid = valid;
-        sim = rpc.simulate(&encode(&tx)?, signing, &[key.pubkey])?;
+        (tx, last_valid, sim) = fresh_simulated(&rpc, payload, &signers, &key.pubkey)?;
     }
     report.compute_units = sim.units;
     report.fee = rpc
@@ -314,11 +309,13 @@ fn pipeline(
                 false,
             ));
         }
-        // Approval can outlast a blockhash; re-sign the same instructions with a fresh one.
-        let (hash, last_valid) = rpc.latest_blockhash()?;
-        let message =
-            Message::new_with_blockhash(&payload.instructions, Some(&payload.fee_payer), &hash);
-        (build(message, &signers, hash)?, last_valid)
+        match after_approval(&rpc, payload, &signers, &key.pubkey, report)? {
+            Ok((fresh, last_valid, r)) => {
+                report = r;
+                (fresh, last_valid)
+            }
+            Err(failed) => return Ok((failed, false)),
+        }
     } else {
         (tx, last_valid)
     };
@@ -429,6 +426,74 @@ fn landed_outcome(report: &mut Report, st: Status) -> Outcome {
         }
         None => Outcome::Confirmed,
     }
+}
+
+/// The two calls a fresh rebuild needs; a trait so the rebuild can be tested without a node.
+pub trait Fresh {
+    fn latest_blockhash(&self) -> std::result::Result<(Hash, u64), RpcError>;
+    fn simulate_signed(
+        &self,
+        tx_b64: &str,
+        accounts: &[solana_address::Address],
+    ) -> std::result::Result<Simulation, RpcError>;
+}
+
+impl Fresh for Rpc {
+    fn latest_blockhash(&self) -> std::result::Result<(Hash, u64), RpcError> {
+        Self::latest_blockhash(self)
+    }
+    fn simulate_signed(
+        &self,
+        tx_b64: &str,
+        accounts: &[solana_address::Address],
+    ) -> std::result::Result<Simulation, RpcError> {
+        self.simulate(tx_b64, true, accounts)
+    }
+}
+
+/// Approval can outlast a blockhash, so the approved instructions are re-signed with a fresh one
+/// and that exact transaction is simulated before it may be sent: it is new bytes. A failure
+/// comes back as the report to return (`SimulationFailed`, nothing sent).
+fn after_approval(
+    chain: &impl Fresh,
+    payload: &Payload,
+    signers: &[&Keypair],
+    payer: &solana_address::Address,
+    mut report: Report,
+) -> Result<std::result::Result<(Transaction, u64, Report), Report>> {
+    let (tx, last_valid, sim) = fresh_simulated(chain, payload, signers, payer)?;
+    if let Some(err) = sim.err {
+        report.outcome = Outcome::SimulationFailed;
+        report.program_error = program_error(&sim.logs);
+        report.detail = Some(format!(
+            "after approval: {}",
+            report
+                .program_error
+                .clone()
+                .unwrap_or_else(|| err.to_string())
+        ));
+        report.error = Some(err);
+        report.logs = sim.logs;
+        return Ok(Err(report));
+    }
+    Ok(Ok((tx, last_valid, report)))
+}
+
+/// Re-signs the payload's instructions with a fresh blockhash and simulates that exact
+/// transaction. Returns the transaction, its last valid block height, and its own simulation, so
+/// what is sent is always what was simulated.
+fn fresh_simulated(
+    chain: &impl Fresh,
+    payload: &Payload,
+    signers: &[&Keypair],
+    payer: &solana_address::Address,
+) -> Result<(Transaction, u64, Simulation)> {
+    let (hash, last_valid) = chain.latest_blockhash()?;
+    let message =
+        Message::new_with_blockhash(&payload.instructions, Some(&payload.fee_payer), &hash);
+    let tx = build(message, signers, hash)?;
+    let sim = chain.simulate_signed(&encode(&tx)?, &[*payer])?;
+    Ok((tx, last_valid, sim))
 }
 
 fn note_failure(failures: u32, report: &mut Report, e: &RpcError) -> u32 {
@@ -664,7 +729,7 @@ mod tests {
         assert_eq!(program_error(&logs(&["Program X success"])), None);
     }
 
-    use crate::rpc::{Finalized, HistoryStatus, Status, TxMeta};
+    use crate::rpc::{Finalized, HistoryStatus, Simulation, Status, TxMeta};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
@@ -905,6 +970,87 @@ mod tests {
         let r = confirm_with(&chain);
         assert_eq!(r.outcome, Outcome::Unknown);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A node for the post-approval rebuild: hands out a fresh blockhash and records exactly
+    /// which transaction it was asked to simulate.
+    struct Rebuild {
+        hash: Hash,
+        sim_err: Option<Value>,
+        simulated: RefCell<Vec<String>>,
+    }
+
+    impl Fresh for Rebuild {
+        fn latest_blockhash(&self) -> R<(Hash, u64)> {
+            Ok((self.hash.clone(), 777))
+        }
+        fn simulate_signed(&self, tx_b64: &str, _: &[Address]) -> R<Simulation> {
+            self.simulated.borrow_mut().push(tx_b64.to_owned());
+            Ok(Simulation {
+                err: self.sim_err.clone(),
+                logs: vec!["Program log: Error: would fail".into()],
+                units: Some(1),
+                post_lamports: vec![],
+            })
+        }
+    }
+
+    fn approved_payload(payer: &Keypair) -> Payload {
+        let text = crate::transfer::fund_payload(
+            &payer.pubkey(),
+            &Address::new_from_array([2; 32]),
+            1,
+            "fund",
+        )
+        .to_string();
+        Payload::parse(&text).unwrap()
+    }
+
+    // Pinchy's review, P1: the post-approval transaction is new bytes and must itself be simulated.
+    #[test]
+    fn after_approval_sends_only_the_transaction_it_simulated() {
+        let payer = Keypair::new();
+        let payload = approved_payload(&payer);
+        let node = Rebuild {
+            hash: Hash::new_from_array([5; 32]),
+            sim_err: None,
+            simulated: RefCell::new(vec![]),
+        };
+        let (tx, last_valid, _) =
+            after_approval(&node, &payload, &[&payer], &payer.pubkey(), blank())
+                .unwrap()
+                .unwrap();
+        assert_eq!(last_valid, 777);
+        assert_eq!(
+            tx.message.recent_blockhash, node.hash,
+            "uses the fresh blockhash"
+        );
+        assert_eq!(
+            node.simulated.borrow().as_slice(),
+            [encode(&tx).unwrap()],
+            "the returned transaction is exactly the one simulated"
+        );
+    }
+
+    #[test]
+    fn after_approval_refuses_to_send_when_the_new_simulation_fails() {
+        let payer = Keypair::new();
+        let payload = approved_payload(&payer);
+        let node = Rebuild {
+            hash: Hash::new_from_array([5; 32]),
+            sim_err: Some(serde_json::json!({"InstructionError": [0, {"Custom": 7}]})),
+            simulated: RefCell::new(vec![]),
+        };
+        let report = after_approval(&node, &payload, &[&payer], &payer.pubkey(), blank())
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(report.outcome, Outcome::SimulationFailed);
+        assert!(
+            report
+                .detail
+                .is_some_and(|d| d.starts_with("after approval"))
+        );
+        assert_eq!(node.simulated.borrow().len(), 1);
     }
 
     #[test]
