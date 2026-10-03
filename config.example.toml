@@ -13,9 +13,15 @@ pubkey = "REPLACE_WITH_PUBKEY_FROM_key_new"
 # profile = "PROFILE_ADDRESS"
 # rate_limit_per_minute = 30
 # daily_lamport_cap = 50000000     # 0.05 ZINK
+# extra_programs = []               # more programs this key may call at the top level. They are
+#                                   # NOT trusted as game programs: token accounts can't be created
+#                                   # for accounts they own. Add only programs you trust.
 
 # Path A only: the profile authority and asset wallet held by the agent.
 # Defaults to approval = "confirm": each signature is approved on the terminal.
+# A wallet key cannot be "auto" or listed on a serve token: it signs only through the CLI
+# with a person at the terminal. allow_unattended = true lifts both rules; use it only for a
+# throwaway testnet key, since the signer does not decode what a profile grant gives away.
 # [keys.alice-wallet]
 # class = "wallet"
 # pubkey = "WALLET_PUBKEY"

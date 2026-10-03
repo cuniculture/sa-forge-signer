@@ -1,8 +1,11 @@
-//! Append-only, hash-chained JSONL audit log. Never holds secret material.
+//! Append-only, hash-chained JSONL audit log, and the per-key signing lock.
+//!
+//! The signer writes no key material here. `summary` and `intent` are caller-supplied text and
+//! are recorded as given: callers must not put secrets in them.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -37,6 +40,42 @@ impl Entry {
         let mut unsigned = self.clone();
         unsigned.hash = String::new();
         Ok(hex(&Sha256::digest(serde_json::to_vec(&unsigned)?)))
+    }
+}
+
+/// An exclusive per-key lock under `state_dir/locks/`, held for a whole sign: from the limit
+/// check, through the pre-send intent entry and confirmation, to the final audit entry. It is a
+/// file lock, so it serializes signs across `serve` threads and separate CLI processes alike.
+pub struct KeyLock {
+    file: File,
+}
+
+impl KeyLock {
+    pub fn acquire(state_dir: &Path, key: &str) -> Result<Self> {
+        let dir = state_dir.join("locks");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join(format!("{key}.lock"));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for KeyLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
