@@ -44,6 +44,8 @@ const ATA_CREATE: u8 = 0;
 const ATA_CREATE_IDEMPOTENT: u8 = 1;
 // Account positions in both create forms: payer, new account, owner (wallet), mint, system, token.
 const ATA_OWNER: usize = 2;
+const ATA_SYSTEM: usize = 4;
+const ATA_TOKEN_PROGRAM: usize = 5;
 const ATA_ACCOUNTS: usize = 6;
 
 /// Runs every check that needs only the message; returns the names of the checks passed.
@@ -110,6 +112,21 @@ fn tokens(message: &Message) -> Result<(), Refusal> {
                     "tokens",
                     format!(
                         "instruction {i} is associated-token instruction {tag}; only create is allowed"
+                    ),
+                ));
+            }
+            // The ATA program does not check the token program it is given: it sizes the new account
+            // by asking it and makes it the owner, so any other program could take the rent.
+            let system = parse(SYSTEM_PROGRAM)?;
+            let account = |n: usize| account_of(message, ix, n);
+            let known = ix.accounts.len() >= ATA_ACCOUNTS
+                && account(ATA_SYSTEM) == Some(&system)
+                && account(ATA_TOKEN_PROGRAM).is_some_and(|p| p == &token || p == &token_2022);
+            if !known {
+                return Err(refuse(
+                    "tokens",
+                    format!(
+                        "instruction {i} creates a token account without the System and SPL Token or Token-2022 programs"
                     ),
                 ));
             }
@@ -392,14 +409,20 @@ mod tests {
     fn associated_token_program_may_only_create() {
         const RECOVER_NESTED: u8 = 2;
         for data in [vec![], vec![ATA_CREATE], vec![ATA_CREATE_IDEMPOTENT]] {
-            let ix = token_ix(ASSOCIATED_TOKEN_PROGRAM, data.clone());
+            let ix = Instruction {
+                data: data.clone(),
+                ..ata_create(addr(1))
+            };
             assert!(
                 run_allowing(&[ix], &[ASSOCIATED_TOKEN_PROGRAM]).is_ok(),
                 "ATA create {data:?} is allowed"
             );
         }
         for data in [vec![RECOVER_NESTED], vec![ATA_CREATE_IDEMPOTENT, 0]] {
-            let ix = token_ix(ASSOCIATED_TOKEN_PROGRAM, data.clone());
+            let ix = Instruction {
+                data: data.clone(),
+                ..ata_create(addr(1))
+            };
             assert_eq!(
                 run_allowing(&[ix], &[ASSOCIATED_TOKEN_PROGRAM])
                     .unwrap_err()
@@ -423,6 +446,43 @@ mod tests {
             ],
             data: vec![ATA_CREATE_IDEMPOTENT],
         }
+    }
+
+    // An ATA create must name the real System and token programs, or the token program it names
+    // owns the new account and its rent.
+    #[test]
+    fn associated_token_create_needs_the_real_system_and_token_programs() {
+        let token_2022 = Instruction {
+            accounts: {
+                let mut a = ata_create(addr(1)).accounts;
+                a[5] = AccountMeta::new_readonly(
+                    Address::from_str(TOKEN_2022_PROGRAM).unwrap(),
+                    false,
+                );
+                a
+            },
+            ..ata_create(addr(1))
+        };
+        assert!(run_allowing(&[token_2022], &[ASSOCIATED_TOKEN_PROGRAM]).is_ok());
+        for (slot, fake) in [(5, addr(9)), (4, addr(9))] {
+            let mut ix = ata_create(addr(1));
+            ix.accounts[slot] = AccountMeta::new_readonly(fake, false);
+            assert_eq!(
+                run_allowing(&[ix], &[ASSOCIATED_TOKEN_PROGRAM])
+                    .unwrap_err()
+                    .check,
+                "tokens",
+                "account {slot} must be the real program"
+            );
+        }
+        let mut short = ata_create(addr(1));
+        short.accounts.truncate(5);
+        assert_eq!(
+            run_allowing(&[short], &[ASSOCIATED_TOKEN_PROGRAM])
+                .unwrap_err()
+                .check,
+            "tokens"
+        );
     }
 
     fn owners_to_verify(ixs: &[Instruction], to: &[Address]) -> Result<Vec<Address>, Refusal> {
