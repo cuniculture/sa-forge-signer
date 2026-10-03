@@ -251,9 +251,11 @@ impl Config {
         Ok(out)
     }
 
-    /// The allowed programs that own game state: everything but the System, token and compute
-    /// budget programs. An account they own can only be changed by game logic.
-    pub fn game_programs(&self, key: &KeyConfig) -> Result<Vec<Address>> {
+    /// The cluster's built-in programs that own game state: its profile minus the System, token and
+    /// compute budget programs. A key's `extra_programs` are deliberately not included: they may
+    /// call them, but an account an extra program owns is not trusted to hold token-account rent,
+    /// since that program might let a requester close the account and take the rent.
+    pub fn game_programs(&self) -> Result<Vec<Address>> {
         let utility = [
             cluster::SYSTEM_PROGRAM,
             cluster::ASSOCIATED_TOKEN_PROGRAM,
@@ -265,7 +267,11 @@ impl Config {
         .map(|a| parse_address("program", a))
         .collect::<Result<Vec<_>>>()?;
         Ok(self
-            .allowed_programs(key)?
+            .cluster
+            .programs
+            .iter()
+            .map(|(label, addr)| parse_address(label, addr))
+            .collect::<Result<Vec<_>>>()?
             .into_iter()
             .filter(|p| !utility.contains(p))
             .collect())
@@ -368,12 +374,19 @@ mod tests {
 
     #[test]
     fn game_programs_exclude_the_utility_programs() {
+        // Pinchy's re-review of 2f942bf, P2: a key's extra_programs do not become game programs.
         let c = parse(&format!(
-            "[keys.s]\nclass = \"session\"\npubkey = \"{KEY}\"\n"
+            "[keys.s]\nclass = \"session\"\npubkey = \"{KEY}\"\nextra_programs = [\"{KEY}\"]\n"
         ))
         .unwrap();
+        assert!(
+            c.allowed_programs(c.key("s").unwrap())
+                .unwrap()
+                .iter()
+                .any(|p| p.to_string() == KEY)
+        );
         let games: Vec<String> = c
-            .game_programs(c.key("s").unwrap())
+            .game_programs()
             .unwrap()
             .iter()
             .map(ToString::to_string)

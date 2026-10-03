@@ -248,7 +248,7 @@ fn preflight(
         )));
     }
     passed.push("new_accounts");
-    if let Err(r) = ata_owners(cfg, rpc, key, &message, &policy)? {
+    if let Err(r) = ata_owners(cfg, rpc, &message, &policy)? {
         return Ok(Err(r));
     }
     passed.push("ata_owners");
@@ -263,13 +263,12 @@ fn preflight(
 }
 
 /// An associated token account created for an owner other than the signing key or its transfer
-/// destinations must belong to a game account: an account owned by one of the key's game programs
-/// (a character, a cargo cache). Its rent then stays where only game logic can move it, rather than
+/// destinations must belong to a game account: an account owned by one of the cluster's built-in
+/// game programs (a character, a cargo cache), never one only a key's `extra_programs` owns. Its rent then stays where only game logic can move it, rather than
 /// in a wallet the requester could close the account from and reclaim the rent.
 fn ata_owners(
     cfg: &Config,
     rpc: &Rpc,
-    key: &KeyConfig,
     message: &Message,
     policy: &Policy<'_>,
 ) -> Result<Result<(), Refusal>> {
@@ -280,7 +279,7 @@ fn ata_owners(
     if owners.is_empty() {
         return Ok(Ok(()));
     }
-    let games = cfg.game_programs(key)?;
+    let games = cfg.game_programs()?;
     for (who, program) in owners.iter().zip(rpc.account_owners(&owners)?) {
         if !program.is_some_and(|p| games.contains(&p)) {
             return Ok(Err(refusal(
@@ -315,7 +314,7 @@ fn pipeline(
         None
     };
     let signers = signers_for(keypair.as_ref(), &payload.partial_signers);
-    let mut tx = build(message.clone(), &signers, blockhash)?;
+    let mut tx = build(message, &signers, blockhash)?;
     let pre = rpc.balance(&key.pubkey)?;
     let mut sim = rpc.simulate(&encode(&tx)?, signing, &[key.pubkey])?;
     // A slow preflight can outlive the blockhash on the simulating node; every key is here, so re-sign once.
@@ -323,8 +322,9 @@ fn pipeline(
         (tx, last_valid, sim) = fresh_simulated(&rpc, payload, &signers, &key.pubkey)?;
     }
     report.compute_units = sim.units;
+    // The fee of the transaction actually built, which a blockhash rebuild replaces.
     report.fee = rpc
-        .fee_for_message(&b64(&message.serialize()))
+        .fee_for_message(&b64(&tx.message.serialize()))
         .ok()
         .flatten();
     report.balance_change = sim
@@ -507,6 +507,7 @@ fn landed_outcome(report: &mut Report, st: Status) -> Outcome {
 /// The two calls a fresh rebuild needs; a trait so the rebuild can be tested without a node.
 pub trait Fresh {
     fn balance(&self, address: &solana_address::Address) -> std::result::Result<u64, RpcError>;
+    fn fee_for_message(&self, message_b64: &str) -> std::result::Result<Option<u64>, RpcError>;
     fn latest_blockhash(&self) -> std::result::Result<(Hash, u64), RpcError>;
     fn simulate_signed(
         &self,
@@ -518,6 +519,9 @@ pub trait Fresh {
 impl Fresh for Rpc {
     fn balance(&self, address: &solana_address::Address) -> std::result::Result<u64, RpcError> {
         Self::balance(self, address)
+    }
+    fn fee_for_message(&self, message_b64: &str) -> std::result::Result<Option<u64>, RpcError> {
+        Self::fee_for_message(self, message_b64)
     }
     fn latest_blockhash(&self) -> std::result::Result<(Hash, u64), RpcError> {
         Self::latest_blockhash(self)
@@ -533,8 +537,8 @@ impl Fresh for Rpc {
 
 /// Approval can outlast a blockhash, so the approved instructions are re-signed with a fresh one
 /// and that exact transaction is simulated before it may be sent: it is new bytes. Its own
-/// simulated spend replaces the earlier one, so the cap check and the reservation see what is
-/// sent. A failure comes back as the report to return (`SimulationFailed`, nothing sent).
+/// simulated spend and fee replace the earlier ones, so the cap check and the reservation see
+/// what is sent. A failure comes back as the report to return (`SimulationFailed`, nothing sent).
 fn after_approval(
     chain: &impl Fresh,
     payload: &Payload,
@@ -551,6 +555,10 @@ fn after_approval(
         .copied()
         .flatten()
         .and_then(|post| delta(pre, post));
+    report.fee = chain
+        .fee_for_message(&b64(&tx.message.serialize()))
+        .ok()
+        .flatten();
     if let Some(err) = sim.err {
         report.outcome = Outcome::SimulationFailed;
         report.program_error = program_error(&sim.logs);
@@ -713,7 +721,7 @@ fn cap_gate(entries: &[Entry], key: &KeyConfig, report: &Report, now: u64) -> Re
     let reserve = reservation(report).ok_or_else(|| {
         refusal(
             "limits",
-            "the simulation did not report this key's balance, so the spend cannot be bounded"
+            "the simulation did not report this key's balance, or the RPC gave no fee estimate, so the spend cannot be bounded"
                 .to_owned(),
         )
     })?;
@@ -721,12 +729,11 @@ fn cap_gate(entries: &[Entry], key: &KeyConfig, report: &Report, now: u64) -> Re
     Ok(reserve)
 }
 
-/// This transaction's reservation: its simulated spend plus the fee, when the simulation reported
-/// the key's balance.
+/// This transaction's reservation: its simulated spend plus its fee. Both must be known: the
+/// simulated balance usually already includes the fee, so adding it again over-reserves by one
+/// fee, but a missing fee is never assumed to be zero.
 fn reservation(report: &Report) -> Option<u64> {
-    report
-        .balance_change
-        .map(|d| spend(d).saturating_add(report.fee.unwrap_or(0)))
+    Some(spend(report.balance_change?).saturating_add(report.fee?))
 }
 
 /// Refuses a transaction whose reservation would take the 24 h total past the cap.
@@ -924,7 +931,7 @@ mod tests {
         };
         let past = [entry(10, -49_000_000)];
         // Pinchy's example: 49M spent, a 40M spend would end at 89M.
-        let r = cap_gate(&past, &k, &simulated(Some(-40_000_000), None), 100).unwrap_err();
+        let r = cap_gate(&past, &k, &simulated(Some(-40_000_000), Some(0)), 100).unwrap_err();
         assert!(r.detail.contains("40000000 for this transaction"), "{r}");
         // Exactly reaching the cap is allowed; one lamport more is not.
         assert_eq!(
@@ -939,6 +946,8 @@ mod tests {
             cap_gate(&[], &k, &simulated(Some(10), Some(5_000)), 100),
             Ok(5_000)
         );
+        // Pinchy's re-review of 2f942bf, P2: no fee estimate is not a zero fee.
+        assert!(cap_gate(&[], &k, &simulated(Some(-1), None), 100).is_err());
     }
 
     #[test]
@@ -1263,6 +1272,9 @@ mod tests {
         sim_err: Option<Value>,
         /// The key's balance before, and as simulated after, the rebuilt transaction.
         lamports: (u64, Option<u64>),
+        /// The fee the node quotes for the rebuilt message.
+        fee: Option<u64>,
+        fee_asked: RefCell<Vec<String>>,
         simulated: RefCell<Vec<String>>,
     }
 
@@ -1272,6 +1284,8 @@ mod tests {
                 hash: Hash::new_from_array([5; 32]),
                 sim_err,
                 lamports,
+                fee: Some(5_000),
+                fee_asked: RefCell::new(vec![]),
                 simulated: RefCell::new(vec![]),
             }
         }
@@ -1280,6 +1294,10 @@ mod tests {
     impl Fresh for Rebuild {
         fn balance(&self, _: &Address) -> R<u64> {
             Ok(self.lamports.0)
+        }
+        fn fee_for_message(&self, message_b64: &str) -> R<Option<u64>> {
+            self.fee_asked.borrow_mut().push(message_b64.to_owned());
+            Ok(self.fee)
         }
         fn latest_blockhash(&self) -> R<(Hash, u64)> {
             Ok((self.hash.clone(), 777))
@@ -1336,10 +1354,16 @@ mod tests {
         let payload = approved_payload(&payer);
         // blank() carries an approval-time spend of -1.
         let spent = Rebuild::new(None, (1_000, Some(400)));
-        let (_, _, r) = after_approval(&spent, &payload, &[&payer], &payer.pubkey(), blank())
+        let (tx, _, r) = after_approval(&spent, &payload, &[&payer], &payer.pubkey(), blank())
             .unwrap()
             .unwrap();
         assert_eq!((r.balance_change, r.compute_units), (Some(-600), Some(1)));
+        // Pinchy's re-review of 2f942bf, P2: the fee is quoted for the rebuilt message itself.
+        assert_eq!(r.fee, Some(5_000));
+        assert_eq!(
+            spent.fee_asked.borrow().as_slice(),
+            [b64(&tx.message.serialize())]
+        );
         // No balance in the new simulation: nothing stale is kept, so `cap_gate` refuses.
         let blind = Rebuild::new(None, (1_000, None));
         let (_, _, r) = after_approval(&blind, &payload, &[&payer], &payer.pubkey(), blank())

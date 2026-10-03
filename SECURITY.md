@@ -14,9 +14,9 @@
 | Another local process or a web page calls `serve` | Every route but `/health` needs a bearer token; config stores only its sha256 and the keys it may use. Host and Origin must be an allowed host. |
 | A restart mid-sign | `serve` drains running requests on SIGTERM/SIGINT (up to 220 s) before exiting; a dropped connection during `sign` means `unknown`, not failed. |
 | Double actions after a timeout | Nothing short of a landed status is reported as final: an expired blockhash with no status found is `unknown`, since an RPC cannot prove absence (see below). Callers must reconcile the signature and the on-chain state before retrying (README, "Retrying safely"). |
-| A transaction that takes the key past its daily cap | The cap is checked under the key lock, after the final simulation, against spent-or-reserved plus this transaction's simulated spend and fee; with no simulated balance the sign is refused. |
+| A transaction that takes the key past its daily cap | The cap is checked under the key lock, after the final simulation, against spent-or-reserved plus this transaction's simulated spend and fee; with no simulated balance or no fee estimate the sign is refused. The simulated balance usually includes the fee already, so this over-reserves by one fee rather than ever under-counting. |
 | Concurrent signs racing the limits | Signs with one key are serialized by a file lock, and every send is recorded as an intent with its reservation before it leaves; unresolved spends are charged that reservation. |
-| Rent paid out through token-account creation | Associated Token may create accounts only for the signing key, its transfer destinations, or an existing account owned by a game program. |
+| Rent paid out through token-account creation | Associated Token may create accounts only for the signing key, its transfer destinations, or an existing account owned by one of the cluster's built-in game programs (not a key's `extra_programs`). |
 
 ## Not covered
 
