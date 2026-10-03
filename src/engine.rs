@@ -149,21 +149,23 @@ pub fn execute(
         None => cfg.key_for_pubkey(&payload.fee_payer)?,
     };
     let signing = matches!(mode, Mode::Sign { .. });
+    let authorized = allowed.is_none_or(|keys| keys.contains(&key.name));
     // Held until this function returns, after the final audit entry: no other sign with this key,
-    // in this process or another, can pass the limit check in between.
-    let _lock = if signing {
+    // in this process or another, can pass the limit check in between. Not taken for a token that
+    // may not use the key, so it cannot queue behind (or hold up) that key's signs.
+    let _lock = if signing && authorized {
         Some(KeyLock::acquire(&cfg.state_dir, &key.name)?)
     } else {
         None
     };
-    let (report, sent) = if allowed.is_some_and(|keys| !keys.contains(&key.name)) {
+    let (report, sent) = if authorized {
+        pipeline(cfg, key, &payload, mode)?
+    } else {
         let r = refusal(
             "authorized",
             format!("this token may not use key {:?}", key.name),
         );
         (Report::new(&payload, key).refused(&r), false)
-    } else {
-        pipeline(cfg, key, &payload, mode)?
     };
     if signing {
         let entry = Entry {
