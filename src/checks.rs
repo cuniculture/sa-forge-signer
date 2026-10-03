@@ -7,7 +7,11 @@ use solana_address::Address;
 use solana_message::Message;
 use solana_message::compiled_instruction::CompiledInstruction;
 
-use crate::cluster::{ASSOCIATED_TOKEN_PROGRAM, SYSTEM_PROGRAM, TOKEN_2022_PROGRAM, TOKEN_PROGRAM};
+use crate::cluster::{
+    ASSOCIATED_TOKEN_PROGRAM, PLAYER_PROFILE_PROGRAM, SYSTEM_PROGRAM, TOKEN_2022_PROGRAM,
+    TOKEN_PROGRAM,
+};
+use crate::config::KeyClass;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Refusal {
@@ -30,6 +34,7 @@ pub struct Policy<'a> {
     pub allowed_programs: &'a [Address],
     pub transfer_to: &'a [Address],
     pub partial_signers: &'a [Address],
+    pub class: KeyClass,
 }
 
 // Public System Program instruction index. Only Transfer is allowed at the top level: forge-mcp
@@ -54,8 +59,16 @@ pub fn structural(message: &Message, policy: &Policy<'_>) -> Result<Vec<&'static
     programs(message, policy)?;
     tokens(message)?;
     system(message, policy)?;
+    vault(message, policy)?;
     signers(message, policy)?;
-    Ok(vec!["fee_payer", "programs", "tokens", "system", "signers"])
+    Ok(vec![
+        "fee_payer",
+        "programs",
+        "tokens",
+        "system",
+        "vault",
+        "signers",
+    ])
 }
 
 fn fee_payer(message: &Message, policy: &Policy<'_>) -> Result<(), Refusal> {
@@ -204,6 +217,47 @@ fn system(message: &Message, policy: &Policy<'_>) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// The Player Profile's `DrainSolVault` discriminator. A session key holds `DRAIN_SOL_VAULT`, so
+/// SAGE's rent drains can sign their CPI, but no forge-mcp build puts `DrainSolVault` at the top
+/// level; named directly it withdraws the profile's whole SOL to any recipient, and the daily
+/// cap measures only the fee payer's lamports. Wallet keys — the profile authority, signing
+/// through the CLI with `confirm` — keep the drain: that is how an operator moves the profile's
+/// SOL back to the wallet.
+const DRAIN_SOL_VAULT: [u8; 8] = [30, 107, 197, 95, 79, 153, 194, 32];
+
+/// Player Profile at the top level only; SAGE's internal CPIs are not visible to the signer.
+fn vault(message: &Message, policy: &Policy<'_>) -> Result<(), Refusal> {
+    let profile =
+        Address::from_str(PLAYER_PROFILE_PROGRAM).map_err(|e| refuse("vault", e.to_string()))?;
+    for (i, ix) in message.instructions.iter().enumerate() {
+        if program_of(message, ix) != Some(&profile) {
+            continue;
+        }
+        if ix.data.len() < 8 {
+            // An unparseable instruction may hide anything, including a drain; session keys
+            // must not send one.
+            if policy.class == KeyClass::Session {
+                return Err(refuse(
+                    "vault",
+                    format!(
+                        "instruction {i} is too short to parse as a Player Profile instruction"
+                    ),
+                ));
+            }
+            continue;
+        }
+        if ix.data.starts_with(&DRAIN_SOL_VAULT) && policy.class == KeyClass::Session {
+            return Err(refuse(
+                "vault",
+                format!(
+                    "instruction {i} withdraws the profile vault, which is refused for this key"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn signers(message: &Message, policy: &Policy<'_>) -> Result<(), Refusal> {
     for p in policy.partial_signers {
         if p == policy.signer {
@@ -279,6 +333,7 @@ mod tests {
                 allowed_programs: &allowed,
                 transfer_to: to,
                 partial_signers: partial,
+                class: KeyClass::Session,
             },
         )
     }
@@ -386,6 +441,7 @@ mod tests {
                 allowed_programs: &allowed,
                 transfer_to: &[],
                 partial_signers: &[],
+                class: KeyClass::Session,
             },
         )
     }
@@ -493,6 +549,7 @@ mod tests {
                 allowed_programs: &[],
                 transfer_to: to,
                 partial_signers: &[],
+                class: KeyClass::Session,
             },
         )
     }
@@ -560,6 +617,113 @@ mod tests {
                 .unwrap_err()
                 .check,
             "signers"
+        );
+    }
+
+    fn profile_ix(discriminator: &[u8], recipient: Address) -> Instruction {
+        Instruction {
+            program_id: Address::from_str(PLAYER_PROFILE_PROGRAM).unwrap(),
+            accounts: vec![
+                AccountMeta::new_readonly(addr(1), true),
+                AccountMeta::new_readonly(recipient, false),
+            ],
+            data: discriminator.to_vec(),
+        }
+    }
+
+    fn run_profile(ixs: &[Instruction], class: KeyClass) -> Result<Vec<&'static str>, Refusal> {
+        let message = Message::new(ixs, Some(&addr(1)));
+        let allowed = [
+            Address::from_str(SYSTEM_PROGRAM).unwrap(),
+            addr(9),
+            Address::from_str(PLAYER_PROFILE_PROGRAM).unwrap(),
+        ];
+        structural(
+            &message,
+            &Policy {
+                signer: &addr(1),
+                allowed_programs: &allowed,
+                transfer_to: &[],
+                partial_signers: &[],
+                class,
+            },
+        )
+    }
+
+    // A session key holds DRAIN_SOL_VAULT, so it can sign SAGE's rent-drain CPIs, but no forge-mcp
+    // build puts DrainSolVault at the top level; named there it empties the profile's SOL to any
+    // recipient, and the daily cap does not see it.
+    #[test]
+    fn refuses_top_level_vault_drain_for_session_keys() {
+        // A real drain carries its args after the discriminator: key index (u16), amount (u64).
+        let mut real = DRAIN_SOL_VAULT.to_vec();
+        real.extend_from_slice(&1_u16.to_le_bytes());
+        real.extend_from_slice(&4_000_000_000_u64.to_le_bytes());
+        for data in [DRAIN_SOL_VAULT.to_vec(), real.clone()] {
+            for recipient in [addr(1), addr(3)] {
+                // the signer, and a stranger
+                let ix = profile_ix(&data, recipient);
+                assert_eq!(
+                    run_profile(&[ix], KeyClass::Session).unwrap_err().check,
+                    "vault"
+                );
+            }
+        }
+        // Behind a harmless instruction, it is still found.
+        let hidden = [game_ix(), profile_ix(&real, addr(3))];
+        let refusal = run_profile(&hidden, KeyClass::Session).unwrap_err();
+        assert_eq!(refusal.check, "vault");
+        assert!(refusal.detail.contains("instruction 1"), "{refusal}");
+    }
+
+    // The wallet key is the profile authority, signing through the CLI with confirm; it keeps the
+    // drain so an operator can move the profile's SOL back to the wallet.
+    #[test]
+    fn allows_top_level_vault_drain_for_wallet_keys() {
+        let ix = profile_ix(&DRAIN_SOL_VAULT, addr(1));
+        assert!(
+            run_profile(&[ix], KeyClass::Wallet)
+                .unwrap()
+                .contains(&"vault")
+        );
+    }
+
+    // A Player Profile instruction that is not a drain passes `vault` for a session key; the
+    // chain checks its permissions (this check does not decode game instructions).
+    #[test]
+    fn other_player_profile_instructions_pass_vault_for_session_keys() {
+        // An AddKeys-style discriminator, not DrainSolVault.
+        let ix = profile_ix(&[32, 80, 200, 187, 106, 82, 22, 104], addr(3));
+        assert!(
+            run_profile(&[ix], KeyClass::Session)
+                .unwrap()
+                .contains(&"vault")
+        );
+    }
+
+    #[test]
+    fn refuses_short_player_profile_instruction_for_session_keys() {
+        for data in [Vec::<u8>::new(), DRAIN_SOL_VAULT[..4].to_vec()] {
+            let ix = profile_ix(&data, addr(1));
+            assert_eq!(
+                run_profile(&[ix], KeyClass::Session).unwrap_err().check,
+                "vault"
+            );
+        }
+    }
+
+    #[test]
+    fn structural_lists_vault_among_the_checks_passed() {
+        assert_eq!(
+            run_profile(&[game_ix()], KeyClass::Session).unwrap(),
+            vec![
+                "fee_payer",
+                "programs",
+                "tokens",
+                "system",
+                "vault",
+                "signers"
+            ]
         );
     }
 }

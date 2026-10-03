@@ -56,6 +56,7 @@ pub fn fund_payload(from: &Address, to: &Address, lamports: u64, summary: &str) 
 mod tests {
     use super::*;
     use crate::checks::{Policy, structural};
+    use crate::config::KeyClass;
     use crate::payload::Payload;
     use solana_message::Message;
     use std::str::FromStr;
@@ -102,6 +103,7 @@ mod tests {
                     allowed_programs: &allowed,
                     transfer_to: dests,
                     partial_signers: &[],
+                    class: KeyClass::Session,
                 },
             )
         };
