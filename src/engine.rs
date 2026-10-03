@@ -237,6 +237,7 @@ fn preflight(
         allowed_programs: &allowed,
         transfer_to: &key.transfer_to,
         partial_signers: &partial,
+        class: key.class,
     };
     match checks::structural(&message, &policy) {
         Ok(checks) => passed.extend(checks),
