@@ -1,6 +1,6 @@
 [package]
 name = "sa-forge-signer"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.89"
 description = "A thin, self-hosted signer for agents playing SAGE C4 on Z.ink. Unofficial."
