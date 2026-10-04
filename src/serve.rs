@@ -18,11 +18,18 @@ use zeroize::Zeroizing;
 use crate::config::{Config, ServeConfig, TokenConfig};
 use crate::engine::{self, Mode, Outcome};
 use crate::payload::hex;
-use crate::rpc::Rpc;
+use crate::rpc::{RPC_TIMEOUT, Rpc};
 
 const MAX_BODY: u64 = 1024 * 1024;
-/// Inside compose's 90 s stop grace period; a sign waits at most until its blockhash expires.
-const DRAIN_DEADLINE: Duration = Duration::from_secs(80);
+/// Requests handled at once; beyond this the accept loop answers 503 instead of spawning threads.
+const MAX_IN_FLIGHT: usize = 32;
+/// A running sign waits up to `engine::CONFIRM_DEADLINE` for a proven outcome, and the poll that
+/// crosses it can still make four RPC calls of up to `RPC_TIMEOUT` each. This covers the typical
+/// case, not a hard worst case: the checks and simulations before sending also make RPC calls,
+/// and a stalled RPC can stretch them too. Stop grace periods (compose, systemd) must exceed it.
+/// A sign cut off anyway has its intent recorded; its signature must be reconciled.
+const DRAIN_DEADLINE: Duration =
+    Duration::from_secs(engine::CONFIRM_DEADLINE.as_secs() + 4 * RPC_TIMEOUT.as_secs() + 10);
 const DRAIN_POLL: Duration = Duration::from_millis(100);
 const MCP_LATEST: &str = "2025-11-25";
 const MCP_VERSIONS: [&str; 3] = [MCP_LATEST, "2025-06-18", "2025-03-26"];
@@ -68,6 +75,12 @@ fn serve_on(server: &tiny_http::Server, cfg: &Arc<Config>) -> Vec<JoinHandle<()>
     let mut running: Vec<JoinHandle<()>> = Vec::new();
     for request in server.incoming_requests() {
         running.retain(|h| !h.is_finished());
+        if running.len() >= MAX_IN_FLIGHT {
+            let busy =
+                Response::from_string(r#"{"error":"busy; retry shortly"}"#).with_status_code(503);
+            let _ = request.respond(busy);
+            continue;
+        }
         let cfg = Arc::clone(cfg);
         running.push(std::thread::spawn(move || handle(&cfg, request)));
     }
@@ -200,7 +213,18 @@ pub fn token_hash(token: &str) -> String {
 
 fn token_for<'a>(serve: &'a ServeConfig, token: &str) -> Option<&'a TokenConfig> {
     let hash = token_hash(token);
-    serve.tokens.iter().find(|t| t.sha256 == hash)
+    // Compare against every token, without short-circuiting on the first differing byte.
+    let mut found = None;
+    for t in &serve.tokens {
+        if constant_time_eq(t.sha256.as_bytes(), hash.as_bytes()) && found.is_none() {
+            found = Some(t);
+        }
+    }
+    found
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0_u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn read_body(request: &mut Request) -> Result<Zeroizing<String>, Reply> {
@@ -298,7 +322,8 @@ fn initialize(params: &Value) -> Value {
         "serverInfo": {"name": "sa-forge-signer", "version": env!("CARGO_PKG_VERSION")},
         "instructions": "Signs SAGE C4 payloads built by forge-mcp. Pass the payload object from a build_* call unchanged. \
             `check` runs every check and a simulation without signing; `sign` checks, simulates, signs, sends and confirms. \
-            The result is a JSON report: act on `outcome` (never resend on `unknown`; rebuild on `expired`).",
+            The result is a JSON report: act on `outcome`. On `unknown`, an HTTP error or a dropped connection, the transaction may still have landed: \
+            look up the reported signature and re-read the game state the action was meant to change before building it again.",
     })
 }
 
@@ -377,6 +402,13 @@ fn key_show(cfg: &Config, token: &TokenConfig, args: &Value) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn constant_time_eq_matches_only_equal_bytes() {
+        assert!(super::constant_time_eq(b"abcd", b"abcd"));
+        assert!(!super::constant_time_eq(b"abcd", b"abce"));
+        assert!(!super::constant_time_eq(b"abcd", b"abc"));
+    }
+
     use super::*;
 
     fn serve() -> ServeConfig {
