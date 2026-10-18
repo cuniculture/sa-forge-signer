@@ -349,24 +349,14 @@ fn pipeline(
         return Ok((report, false));
     }
 
-    let (tx, last_valid) = if key.approval == Approval::Confirm {
-        if !confirm(&report, key)? {
-            return Ok((
-                report.refused(&refusal("approval", "not approved".to_owned())),
-                false,
-            ));
-        }
-        match after_approval(&rpc, payload, &signers, &key.pubkey, report)? {
-            Ok((fresh, last_valid, r)) => {
+    let (tx, last_valid) =
+        match approved_fresh(&rpc, key, payload, &signers, tx, last_valid, report)? {
+            Ok((tx, last_valid, r)) => {
                 report = r;
-                (fresh, last_valid)
+                (tx, last_valid)
             }
             Err(failed) => return Ok((failed, false)),
-        }
-    } else {
-        (tx, last_valid)
-    };
-    report.checks.push("approval");
+        };
     // The cap binds here, under the key lock, against the simulation of the exact transaction
     // about to be sent: what is already spent or reserved plus this transaction's own spend.
     let reserve = match cap_gate(&Audit::new(&cfg.state_dir).entries()?, key, &report, now()) {
@@ -576,6 +566,86 @@ fn after_approval(
         return Ok(Err(report));
     }
     Ok(Ok((tx, last_valid, report)))
+}
+
+/// The person's approval (a `confirm` key, then re-signed with a fresh blockhash), and a
+/// blockhash still valid (`unless_stale`), with the checks passed recorded. A refusal or failure
+/// comes back as the report to return, nothing sent.
+fn approved_fresh(
+    rpc: &Rpc,
+    key: &KeyConfig,
+    payload: &Payload,
+    signers: &[&Keypair],
+    tx: Transaction,
+    last_valid: u64,
+    mut r: Report,
+) -> Result<std::result::Result<(Transaction, u64, Report), Report>> {
+    let (tx, last_valid) = if key.approval == Approval::Confirm {
+        if !confirm(&r, key)? {
+            return Ok(Err(
+                r.refused(&refusal("approval", "not approved".to_owned()))
+            ));
+        }
+        match after_approval(rpc, payload, signers, &key.pubkey, r)? {
+            Ok((fresh, last_valid, next)) => {
+                r = next;
+                (fresh, last_valid)
+            }
+            Err(failed) => return Ok(Err(failed)),
+        }
+    } else {
+        (tx, last_valid)
+    };
+    r.checks.push("approval");
+    let height = || rpc.finalized_height().ok();
+    match unless_stale(
+        rpc,
+        height,
+        tx,
+        last_valid,
+        payload,
+        signers,
+        &key.pubkey,
+        r,
+    )? {
+        Ok((tx, last_valid, mut next)) => {
+            next.checks.push("blockhash");
+            Ok(Ok((tx, last_valid, next)))
+        }
+        Err(failed) => Ok(Err(failed)),
+    }
+}
+
+/// A blockhash whose last valid height is already behind a finalized height can never land,
+/// whichever node reports that height (a lagging node's blockhash, 2026-10-14 and 10-15). It is
+/// re-signed and simulated once with a fresh one; still stale, it is refused, and nothing is sent,
+/// so a retry is safe. A height that cannot be read changes nothing.
+#[allow(clippy::too_many_arguments)]
+fn unless_stale(
+    chain: &impl Fresh,
+    height: impl Fn() -> Option<u64>,
+    tx: Transaction,
+    last_valid: u64,
+    payload: &Payload,
+    signers: &[&Keypair],
+    payer: &solana_address::Address,
+    report: Report,
+) -> Result<std::result::Result<(Transaction, u64, Report), Report>> {
+    if height().is_none_or(|h| h <= last_valid) {
+        return Ok(Ok((tx, last_valid, report)));
+    }
+    match after_approval(chain, payload, signers, payer, report)? {
+        Ok((fresh, last_valid, r)) => match height() {
+            Some(h) if h > last_valid => Ok(Err(r.refused(&refusal(
+                "blockhash",
+                format!(
+                    "the RPC's blockhash is already expired (finalized height {h} is past {last_valid}), also after a fresh one: the RPC lags; nothing was sent"
+                ),
+            )))),
+            _ => Ok(Ok((fresh, last_valid, r))),
+        },
+        Err(failed) => Ok(Err(failed)),
+    }
 }
 
 /// Re-signs the payload's instructions with a fresh blockhash and simulates that exact
@@ -1324,6 +1394,83 @@ mod tests {
         )
         .to_string();
         Payload::parse(&text).unwrap()
+    }
+
+    #[test]
+    fn a_stale_blockhash_is_re_signed_once_then_refused_and_never_sent() {
+        let payer = Keypair::new();
+        let payload = approved_payload(&payer);
+        let stale_tx = || {
+            build(
+                Message::new(&payload.instructions, Some(&payload.fee_payer)),
+                &[&payer],
+                Hash::default(),
+            )
+            .unwrap()
+        };
+        let node = Rebuild::new(None, (1_000, Some(990)));
+        // Fresh: kept as built, nothing simulated again.
+        let (_, lv, _) = unless_stale(
+            &node,
+            || Some(50),
+            stale_tx(),
+            100,
+            &payload,
+            &[&payer],
+            &payer.pubkey(),
+            blank(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((lv, node.simulated.borrow().len()), (100, 0));
+        // Unreadable height: unchanged.
+        assert!(
+            unless_stale(
+                &node,
+                || None,
+                stale_tx(),
+                100,
+                &payload,
+                &[&payer],
+                &payer.pubkey(),
+                blank()
+            )
+            .unwrap()
+            .is_ok()
+        );
+        // Stale (height 500 past 100); the fresh one (valid to 777) is used.
+        let (tx, lv, _) = unless_stale(
+            &node,
+            || Some(500),
+            stale_tx(),
+            100,
+            &payload,
+            &[&payer],
+            &payer.pubkey(),
+            blank(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(lv, 777);
+        assert_eq!(tx.message.recent_blockhash, node.hash);
+        // Stale again after the fresh one: refused, exit 10.
+        let r = unless_stale(
+            &node,
+            || Some(900),
+            stale_tx(),
+            100,
+            &payload,
+            &[&payer],
+            &payer.pubkey(),
+            blank(),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(
+            (r.outcome, r.failed_check),
+            (Outcome::Refused, Some("blockhash"))
+        );
+        assert_eq!(r.outcome.exit_code(), ExitCode::from(10));
     }
 
     // Pinchy's review, P1: the post-approval transaction is new bytes and must itself be simulated.
