@@ -7,6 +7,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 min_days="${MIN_AGE_DAYS:-7}"
 now="$(date +%s)"
 cutoff=$((now - min_days * 86400))
+# "name version" pairs allowed younger than min_days, each with its reason; remove once old enough.
+# rustls 0.23.46: RUSTSEC-2026-0346..0349 (owner's exception, 2026-10-18; 7 days old on 2026-10-21).
+exceptions=("rustls 0.23.46")
 
 # index_path <name>: the sparse index path for a crate name.
 index_path() {
@@ -40,6 +43,10 @@ while read -r name version; do
     [ -n "$pubtime" ] || continue
     published="$(jq -rn --arg t "$pubtime" '$t | fromdateiso8601')"
     if [ "$published" -gt "$cutoff" ]; then
+        if [[ " ${exceptions[*]/%/,} " == *" $name $version, "* ]]; then
+            printf 'allowed: %s %s published %s (an exception)\n' "$name" "$version" "$pubtime"
+            continue
+        fi
         age=$(((now - published) / 86400))
         printf 'too new: %s %s published %s (%s days ago)\n' "$name" "$version" "$pubtime" "$age"
         young=$((young + 1))
