@@ -77,10 +77,12 @@ The config lives at `~/.config/sa-forge-signer/config.toml` unless `--config` or
 |---|---|---|---|
 | `ok` | 0 | `check` passed | - |
 | `confirmed` | 0 | landed | no |
-| `refused` | 10 | a check failed | fix the payload |
+| `refused` | 10 | a check failed | fix the payload; after `failed_check` `blockhash`, nothing was sent and a retry is safe |
 | `simulation_failed` | 11 | the program would reject it | after fixing the cause |
 | `failed` | 12 | landed with a program error | after fixing the cause |
 | `unknown` | 14 | sent but not proven landed: the blockhash expired with no status found, 150 s passed, or the RPC kept failing | only after reconciling (below) |
+
+Before anything is sent, the `blockhash` check compares the transaction's last valid height with the finalized height: a blockhash already past it can never land, whichever node reports the height (a lagging RPC node can hand out an expired blockhash). It is re-signed and simulated once with a fresh one; if that is expired too, the sign is refused and nothing is sent.
 
 Exit code 13 (`expired`) is retired. An RPC cannot prove that a transaction never landed: behind a load balancer, the finalized height and the status lookup can come from different nodes, and a node can lack history. So an expired blockhash with no status found is reported as `unknown`, with that in `detail`.
 
