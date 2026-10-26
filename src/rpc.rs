@@ -424,6 +424,24 @@ mod tests {
         assert!(tx_meta(&Value::Null).is_none());
     }
 
+    /// Whether `request` holds the headers and all `Content-Length` bytes of the body.
+    fn request_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(request.get(..header_end).unwrap_or_default());
+        let length = headers
+            .lines()
+            .filter_map(|l| l.split_once(':'))
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        header_end
+            .checked_add(4)
+            .and_then(|body_start| body_start.checked_add(length))
+            .is_some_and(|total| request.len() >= total)
+    }
+
     const GENESIS: &str = r#"{"jsonrpc":"2.0","id":1,"result":"GENESIS"}"#;
 
     /// A one-shot HTTP server: each accepted connection either closes without answering (as a
@@ -443,8 +461,17 @@ mod tests {
                     return;
                 };
                 counter.fetch_add(1, Ordering::SeqCst);
+                // Read the whole request (headers, then Content-Length bytes of body) before
+                // answering or closing: closing with unread bytes makes the OS reset the
+                // connection, which the client rightly treats as stale and retries.
+                let mut request = Vec::new();
                 let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
+                while let Ok(n @ 1..) = stream.read(&mut buf) {
+                    request.extend_from_slice(buf.get(..n).unwrap_or_default());
+                    if request_complete(&request) {
+                        break;
+                    }
+                }
                 if let Some(body) = answer {
                     let _ = write!(
                         stream,
