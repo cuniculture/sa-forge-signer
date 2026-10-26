@@ -1,8 +1,9 @@
 //! Minimal Solana JSON-RPC client: only the calls the signer needs.
 
 use std::fmt;
+use std::io::ErrorKind;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use solana_address::Address;
@@ -71,9 +72,17 @@ pub struct Rpc {
 }
 
 const COMMITMENT: &str = "confirmed";
-/// Longest any single RPC call may take. It bounds how far a sign can overrun its confirmation
-/// deadline (see `serve::DRAIN_DEADLINE`).
+/// Longest a single RPC attempt may take.
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+/// A pooled keep-alive connection that the node has since closed fails at once when it is reused
+/// (reset, broken pipe, EOF). Live, 2026-10-25: "Connection reset by peer" on the first call after
+/// a quiet spell failed a sign before anything was sent, and its caller halted for 20 hours. One
+/// retry on a fresh connection fixes that. Only a failure this fast is retried.
+pub const STALE_RETRY_WINDOW: Duration = Duration::from_secs(2);
+/// Longest any single RPC call may take, retry included. It bounds how far a sign can overrun its
+/// confirmation deadline (see `serve::DRAIN_DEADLINE`).
+pub const RPC_CALL_MAX: Duration =
+    Duration::from_secs(RPC_TIMEOUT.as_secs() + STALE_RETRY_WINDOW.as_secs());
 
 impl Rpc {
     pub fn new(url: &str) -> Self {
@@ -87,32 +96,52 @@ impl Rpc {
         }
     }
 
+    /// One retry for a stale pooled connection (see `STALE_RETRY_WINDOW`). `sendTransaction` is
+    /// never retried here: `send_and_confirm` already re-sends the same bytes on its own schedule.
     fn call(&self, method: &str, params: &Value) -> Result<Value> {
+        let started = Instant::now();
+        match self.call_once(method, params) {
+            Err((_, true)) if retry_stale(method, started.elapsed()) => {
+                self.call_once(method, params).map_err(|(e, _)| e)
+            }
+            other => other.map_err(|(e, _)| e),
+        }
+    }
+
+    /// One attempt. The error carries whether it looks like a stale pooled connection.
+    fn call_once(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> std::result::Result<Value, (RpcError, bool)> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
         let mut resp = self
             .agent
             .post(&self.url)
             .send_json(&body)
-            .map_err(|e| RpcError::Transport(e.to_string()))?;
+            .map_err(|e| (RpcError::Transport(e.to_string()), stale_connection(&e)))?;
         let status = resp.status();
-        let mut value: Value = resp
-            .body_mut()
-            .read_json()
-            .map_err(|e| RpcError::Transport(format!("HTTP {status}: {e}")))?;
+        let mut value: Value = resp.body_mut().read_json().map_err(|e| {
+            (
+                RpcError::Transport(format!("HTTP {status}: {e}")),
+                stale_connection(&e),
+            )
+        })?;
         if let Some(err) = value.get("error") {
-            return Err(RpcError::Node {
+            let node = RpcError::Node {
                 code: err.get("code").and_then(Value::as_i64).unwrap_or_default(),
                 message: err
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
-            });
+            };
+            return Err((node, false));
         }
         value
             .get_mut("result")
             .map(Value::take)
-            .ok_or_else(|| RpcError::Shape(format!("{method}: no result")))
+            .ok_or_else(|| (RpcError::Shape(format!("{method}: no result")), false))
     }
 
     pub fn genesis_hash(&self) -> Result<String> {
@@ -368,6 +397,18 @@ fn u64_field(v: Option<&Value>, what: &str) -> Result<u64> {
         .ok_or_else(|| RpcError::Shape(what.to_owned()))
 }
 
+/// The ways a reused connection the node already closed fails.
+fn stale_connection(e: &ureq::Error) -> bool {
+    matches!(e, ureq::Error::Io(io) if matches!(
+        io.kind(),
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof
+    ))
+}
+
+fn retry_stale(method: &str, elapsed: Duration) -> bool {
+    method != "sendTransaction" && elapsed < STALE_RETRY_WINDOW
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +422,114 @@ mod tests {
         assert_eq!(m.payer_change, Some(-5000));
         assert_eq!(m.logs, vec!["Program log: hi".to_owned()]);
         assert!(tx_meta(&Value::Null).is_none());
+    }
+
+    const GENESIS: &str = r#"{"jsonrpc":"2.0","id":1,"result":"GENESIS"}"#;
+
+    /// A one-shot HTTP server: each accepted connection either closes without answering (as a
+    /// node does to a pooled connection it already dropped) or answers `result`.
+    fn scripted_node(
+        script: Vec<Option<&'static str>>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        std::thread::spawn(move || {
+            for answer in script {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                if let Some(body) = answer {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            }
+        });
+        (url, seen)
+    }
+
+    #[test]
+    fn a_dropped_connection_is_retried_once_on_a_fresh_one() {
+        let (url, seen) = scripted_node(vec![None, Some(GENESIS)]);
+        assert_eq!(Rpc::new(&url).genesis_hash().unwrap(), "GENESIS");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn only_one_retry() {
+        let (url, seen) = scripted_node(vec![None, None, Some(GENESIS)]);
+        assert!(matches!(
+            Rpc::new(&url).genesis_hash(),
+            Err(RpcError::Transport(_))
+        ));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn send_transaction_is_never_retried_here() {
+        let (url, seen) = scripted_node(vec![None, Some(GENESIS)]);
+        assert!(matches!(
+            Rpc::new(&url).send("AQID"),
+            Err(RpcError::Transport(_))
+        ));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_node_error_answer_is_not_retried() {
+        let (url, seen) = scripted_node(vec![
+            Some(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"node is behind"}}"#),
+            Some(GENESIS),
+        ]);
+        assert!(matches!(
+            Rpc::new(&url).genesis_hash(),
+            Err(RpcError::Node { code: -32005, .. })
+        ));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stale_connection_kinds() {
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                stale_connection(&ureq::Error::Io(std::io::Error::from(kind))),
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::TimedOut,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !stale_connection(&ureq::Error::Io(std::io::Error::from(kind))),
+                "{kind:?}"
+            );
+        }
+        assert!(!stale_connection(&ureq::Error::HostNotFound));
+        assert!(!stale_connection(&ureq::Error::ConnectionFailed));
+    }
+
+    #[test]
+    fn retry_rule() {
+        assert!(retry_stale("getLatestBlockhash", Duration::from_millis(20)));
+        assert!(!retry_stale("sendTransaction", Duration::from_millis(20)));
+        assert!(!retry_stale("getLatestBlockhash", STALE_RETRY_WINDOW));
+        assert_eq!(RPC_CALL_MAX, RPC_TIMEOUT + STALE_RETRY_WINDOW);
     }
 
     #[test]
