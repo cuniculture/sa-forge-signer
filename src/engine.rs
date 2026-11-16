@@ -1,5 +1,6 @@
 //! The check and sign pipeline.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -736,7 +737,22 @@ fn confirm(report: &Report, key: &KeyConfig) -> Result<bool> {
 fn limits(entries: &[Entry], key: &KeyConfig, now: u64) -> Result<u64, Refusal> {
     let mine: Vec<&Entry> = entries.iter().filter(|e| e.key == key.name).collect();
     let finals = || mine.iter().filter(|e| e.command == "sign");
-    let resolved = |sig: &str| finals().any(|e| e.signature.as_deref() == Some(sig));
+    // One pass over the log builds both lookups below. They were once a scan of the whole log per
+    // intent: quadratic, about 80 s at 72,000 entries, run under the key lock after the blockhash
+    // was fetched, so every transaction expired before it was sent.
+    let mut final_sigs: HashSet<&str> = HashSet::new();
+    // The first intent for each signature: its reservation, which may be unrecorded (`None`).
+    let mut first_intent: HashMap<&str, Option<i64>> = HashMap::new();
+    for e in &mine {
+        if let Some(sig) = e.signature.as_deref() {
+            if e.command == "sign" {
+                final_sigs.insert(sig);
+            } else if e.command == SIGN_INTENT {
+                first_intent.entry(sig).or_insert(e.balance_change);
+            }
+        }
+    }
+    let resolved = |sig: &str| final_sigs.contains(sig);
     let orphan_intents = || {
         mine.iter().filter(|e| {
             e.command == SIGN_INTENT && e.signature.as_deref().is_none_or(|s| !resolved(s))
@@ -754,11 +770,8 @@ fn limits(entries: &[Entry], key: &KeyConfig, now: u64) -> Result<u64, Refusal> 
     }
     let cap = key.daily_lamport_cap;
     let reservation = |sig: Option<&str>| -> u64 {
-        let intent = mine
-            .iter()
-            .find(|e| e.command == SIGN_INTENT && sig.is_some() && e.signature.as_deref() == sig);
-        match intent.map(|e| e.balance_change) {
-            Some(Some(d)) => spend(d),
+        match sig.and_then(|s| first_intent.get(s)) {
+            Some(Some(d)) => spend(*d),
             _ => cap,
         }
     };
@@ -935,6 +948,169 @@ mod tests {
             balance_change: change,
             ..Entry::default()
         }
+    }
+
+    // The pre-fix limits(): a scan of the whole log per intent. Kept only to prove the indexed
+    // version returns exactly what it did.
+    #[allow(clippy::all, clippy::pedantic, clippy::nursery)]
+    fn limits_reference(entries: &[Entry], key: &KeyConfig, now: u64) -> Result<u64, Refusal> {
+        let mine: Vec<&Entry> = entries.iter().filter(|e| e.key == key.name).collect();
+        let finals = || mine.iter().filter(|e| e.command == "sign");
+        let resolved = |sig: &str| finals().any(|e| e.signature.as_deref() == Some(sig));
+        let orphan_intents = || {
+            mine.iter().filter(|e| {
+                e.command == SIGN_INTENT && e.signature.as_deref().is_none_or(|s| !resolved(s))
+            })
+        };
+        let recent = finals()
+            .chain(orphan_intents())
+            .filter(|e| e.ts >= now.saturating_sub(MINUTE))
+            .count();
+        if recent >= usize::try_from(key.rate_limit_per_minute).unwrap_or(usize::MAX) {
+            return Err(refusal(
+                "limits",
+                format!("rate limit: {recent} signs in the last minute"),
+            ));
+        }
+        let cap = key.daily_lamport_cap;
+        let reservation = |sig: Option<&str>| -> u64 {
+            let intent = mine.iter().find(|e| {
+                e.command == SIGN_INTENT && sig.is_some() && e.signature.as_deref() == sig
+            });
+            match intent.map(|e| e.balance_change) {
+                Some(Some(d)) => spend(d),
+                _ => cap,
+            }
+        };
+        let day = |e: &&&Entry| e.ts >= now.saturating_sub(DAY);
+        let mut spent: u64 = 0;
+        for e in finals().filter(day) {
+            let cost = match e.outcome.as_str() {
+                "confirmed" | "failed" => e
+                    .balance_change
+                    .map_or_else(|| reservation(e.signature.as_deref()), spend),
+                // `expired` appears only in older logs, from a proof that could be wrong.
+                "unknown" | "expired" => reservation(e.signature.as_deref()),
+                // Refused or failed simulation: never sent.
+                _ => 0,
+            };
+            spent = spent.saturating_add(cost);
+        }
+        for e in orphan_intents().filter(day) {
+            spent = spent.saturating_add(e.balance_change.map_or(cap, spend));
+        }
+        if spent >= cap {
+            return Err(refusal(
+                "limits",
+                format!("daily cap: {spent} of {cap} lamports spent or reserved in 24 h"),
+            ));
+        }
+        Ok(spent)
+    }
+
+    fn messy_log(n: u64) -> Vec<Entry> {
+        let mut v = Vec::new();
+        for i in 0..n {
+            let ts = 1_000_000_u64.saturating_add(i);
+            let sig = format!("s{i}");
+            match i % 7 {
+                // intent resolved by a confirmed final with a recorded change
+                0 | 1 => {
+                    v.push(intent(ts, &sig, Some(-300)));
+                    v.push(sign_final(ts, &sig, "confirmed", Some(-250)));
+                }
+                // unknown outcome: charged its reservation
+                2 => {
+                    v.push(intent(ts, &sig, Some(-120)));
+                    v.push(sign_final(ts, &sig, "unknown", None));
+                }
+                // orphan intent (the process died mid-sign) with and without a reservation
+                3 => v.push(intent(ts, &sig, Some(-90))),
+                4 => v.push(intent(ts, &sig, None)),
+                // a duplicate intent for one signature: the first one's reservation counts
+                5 => {
+                    v.push(intent(ts, &sig, Some(-40)));
+                    v.push(intent(ts, &sig, Some(-999)));
+                    v.push(sign_final(ts, &sig, "unknown", None));
+                }
+                // an intent with no signature at all, and a final that never had an intent
+                _ => {
+                    let mut e = intent(ts, &sig, Some(-10));
+                    e.signature = None;
+                    v.push(e);
+                    v.push(sign_final(ts, &format!("lone{i}"), "failed", Some(-5)));
+                }
+            }
+            // another key's entries never count
+            let mut other = intent(ts, &sig, Some(-1_000_000));
+            other.key = "other".into();
+            v.push(other);
+        }
+        v
+    }
+
+    fn same(a: Result<u64, Refusal>, b: Result<u64, Refusal>) -> bool {
+        match (a, b) {
+            (Ok(x), Ok(y)) => x == y,
+            (Err(x), Err(y)) => format!("{x:?}") == format!("{y:?}"),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn indexed_limits_match_the_reference_on_a_messy_log() {
+        let log = messy_log(700);
+        let now = 1_000_000_u64.saturating_add(700);
+        for (cap, rate) in [
+            (u64::MAX / 4, 100_000_u32),
+            (50_000, 100_000),
+            (1_000_000, 3),
+            (1_000, 100_000),
+        ] {
+            let k = KeyConfig {
+                daily_lamport_cap: cap,
+                rate_limit_per_minute: rate,
+                ..key()
+            };
+            for at in [
+                now,
+                now.saturating_add(30),
+                now.saturating_add(70),
+                now.saturating_add(90_000),
+            ] {
+                assert!(
+                    same(limits(&log, &k, at), limits_reference(&log, &k, at)),
+                    "cap {cap} rate {rate} at {at}: {:?} vs {:?}",
+                    limits(&log, &k, at),
+                    limits_reference(&log, &k, at)
+                );
+            }
+        }
+    }
+
+    // Live, 2026-11-16: 72,000 entries took 83 s in limits(), longer than a blockhash lives, so
+    // nothing landed. The indexed version is linear; even a debug build is well inside this bound.
+    #[test]
+    fn limits_stay_fast_on_a_log_of_live_size() {
+        let mut v = Vec::new();
+        for i in 0..40_000_u64 {
+            let sig = format!("sig{i:080}");
+            let ts = 1_000_000_u64.saturating_add(i);
+            v.push(intent(ts, &sig, Some(-10_000)));
+            v.push(sign_final(ts, &sig, "confirmed", Some(-10_000)));
+        }
+        let k = KeyConfig {
+            daily_lamport_cap: u64::MAX / 4,
+            rate_limit_per_minute: 1_000_000,
+            ..key()
+        };
+        let started = std::time::Instant::now();
+        let _ = limits(&v, &k, 1_040_005);
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(3),
+            "limits() over 80,000 entries took {took:?}"
+        );
     }
 
     fn roomy() -> KeyConfig {
